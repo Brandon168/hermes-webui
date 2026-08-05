@@ -3064,7 +3064,13 @@ def resolve_custom_provider_connection(provider_id: str) -> tuple[str | None, st
 
     # Fallbacks for setups that don't use custom_providers names directly.
     providers_cfg = cfg_data.get("providers", {})
-    provider_specific = providers_cfg.get(pid, {}) if isinstance(providers_cfg, dict) else {}
+    # Keyed ``providers:`` dict (v12 canonical shape) stores the account under
+    # its bare slug (``vercel-vtest314``), not the ``custom:vercel-vtest314``
+    # prefixed id.  Try the prefixed form first (some configs key with it),
+    # then the unprefixed slug; ``{}`` when neither matches.
+    provider_specific = {}
+    if isinstance(providers_cfg, dict):
+        provider_specific = providers_cfg.get(pid) or providers_cfg.get(slug) or {}
     provider_custom = providers_cfg.get("custom", {}) if isinstance(providers_cfg, dict) else {}
 
     model_cfg = cfg_data.get("model", {})
@@ -3073,7 +3079,11 @@ def resolve_custom_provider_connection(provider_id: str) -> tuple[str | None, st
     fallback_base = None
     for candidate in (provider_specific, provider_custom, model_cfg):
         if isinstance(candidate, dict):
-            _base = str(candidate.get("base_url") or "").strip()
+            # Keyed entries spell the endpoint as ``api`` (sometimes ``url``);
+            # legacy custom_providers entries use ``base_url``.
+            _base = str(
+                candidate.get("base_url") or candidate.get("api") or candidate.get("url") or ""
+            ).strip()
             if _base:
                 fallback_base = _base
                 break

@@ -32,8 +32,31 @@ def test_named_custom_provider_preserves_configured_key(monkeypatch):
         "custom:gpu-local-8000", None, None
     )
 
-    assert provider == "custom"
+    # A real api key means the account is NOT keyless: keep the named
+    # custom:<slug> identity so Agent init routes to this exact account
+    # instead of the first account sharing the base URL.
+    assert provider == "custom:gpu-local-8000"
     assert api_key == "real-key"
+    assert base_url == "http://gpu.local:8000/v1"
+
+
+def test_named_custom_provider_with_explicit_key_keeps_identity(monkeypatch):
+    import api.streaming as streaming
+
+    monkeypatch.setattr(
+        streaming,
+        "resolve_custom_provider_connection",
+        lambda provider: (None, "http://gpu.local:8000/v1"),
+    )
+
+    # Caller already resolved a key (explicit_api_key path): keep the named
+    # identity as well — a keyed account must never collapse to bare custom.
+    provider, api_key, base_url = streaming._resolve_custom_provider_runtime_overrides(
+        "custom:gpu-local-8000", "caller-key", None
+    )
+
+    assert provider == "custom:gpu-local-8000"
+    assert api_key == "caller-key"
     assert base_url == "http://gpu.local:8000/v1"
 
 
@@ -126,3 +149,70 @@ def test_resolve_custom_provider_connection_falls_back_to_legacy_env(monkeypatch
 
     assert api_key == "legacy-key"
     assert "CUSTOM_GPU_LOCAL_8000_API_KEY" in caplog.text
+
+
+def test_resolve_custom_provider_connection_keyed_providers_unprefixed_slug(monkeypatch):
+    """Keyed ``providers:`` dict stores the account under its bare slug, not
+    the ``custom:<slug>`` prefixed id; the resolver must find it either way."""
+    import api.config as config
+
+    monkeypatch.setattr(
+        config,
+        "get_config",
+        lambda: {
+            "providers": {
+                "vercel-vtest314": {
+                    "api": "https://ai-gateway.vercel.sh/v1",
+                    "api_key": "vtest-key",
+                },
+            },
+        },
+    )
+
+    api_key, base_url = config.resolve_custom_provider_connection("custom:vercel-vtest314")
+
+    assert api_key == "vtest-key"
+    assert base_url == "https://ai-gateway.vercel.sh/v1"
+
+
+def test_resolve_custom_provider_connection_keyed_providers_api_field(monkeypatch):
+    """Keyed entries spell the endpoint as ``api`` (not legacy ``base_url``)."""
+    import api.config as config
+
+    monkeypatch.setattr(
+        config,
+        "get_config",
+        lambda: {
+            "providers": {
+                "vercel-playground": {
+                    "api": "https://ai-gateway.vercel.sh/v1",
+                    "key_env": "VERCEL_PLAYGROUND_API_KEY",
+                },
+            },
+        },
+    )
+    monkeypatch.setenv("VERCEL_PLAYGROUND_API_KEY", "play-key")
+
+    api_key, base_url = config.resolve_custom_provider_connection("custom:vercel-playground")
+
+    assert api_key == "play-key"
+    assert base_url == "https://ai-gateway.vercel.sh/v1"
+
+
+def test_resolve_custom_provider_connection_keyed_providers_no_match(monkeypatch):
+    """No matching keyed entry -> (None, None), not a crash."""
+    import api.config as config
+
+    monkeypatch.setattr(
+        config,
+        "get_config",
+        lambda: {
+            "providers": {
+                "vercel-vtest314": {"api": "https://ai-gateway.vercel.sh/v1"},
+            },
+        },
+    )
+
+    api_key, base_url = config.resolve_custom_provider_connection("custom:does-not-exist")
+
+    assert (api_key, base_url) == (None, None)

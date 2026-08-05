@@ -461,12 +461,21 @@ def _resolve_custom_provider_runtime_overrides(
     if not resolved_base_url and _cp_base:
         resolved_base_url = _cp_base
     if resolved_base_url:
-        # Route through the generic custom OpenAI-compatible client once the
-        # named provider has supplied the concrete endpoint. Keeping the
-        # provider as custom:<slug> would make Agent init synthesize invalid
-        # env-var hints like CUSTOM:SOMETHING-8000_API_KEY on keyless setups.
-        resolved_provider = "custom"
+        # Only collapse to the generic "custom" client when the endpoint is
+        # genuinely keyless (local OpenAI-compatible servers without auth).
+        # Keeping custom:<slug> for a keyless endpoint would make Agent init
+        # synthesize invalid env-var hints like CUSTOM:SOMETHING-8000_API_KEY.
+        #
+        # When a real api key was resolved, KEEP the named custom:<slug>
+        # identity: collapsing it to bare "custom" erases which account was
+        # picked, and the runtime then self-heals to the FIRST custom provider
+        # sharing the base URL — wrong when two named accounts point at one
+        # gateway (e.g. vercel-playground and vercel-vtest314 both at
+        # https://ai-gateway.vercel.sh/v1). Keeping the name lets
+        # ``_get_named_custom_provider`` route exactly to the picked account
+        # instead of the first-match collision.
         if not resolved_api_key:
+            resolved_provider = "custom"
             resolved_api_key = _KEYLESS_CUSTOM_API_KEY
     return resolved_provider, resolved_api_key, resolved_base_url
 
