@@ -8283,6 +8283,38 @@ def _worktree_default_from_config(profile: str | None) -> bool:
         return False
 
 
+def _configured_default_session_model_state(
+    model: str | None,
+    requested_provider: str | None,
+) -> tuple[str | None, str | None]:
+    """Return the configured default pair when *model* is that default.
+
+    A new-chat request can arrive before the browser has hydrated its model
+    picker.  The backend already owns the authoritative config, so do not make
+    that race pay for a live catalog rebuild—or let the catalog choose a
+    different provider—when the request carries the configured default model.
+    Explicit provider selections never enter this inference path.
+    """
+    if requested_provider is not None:
+        return None, None
+    try:
+        config_data = get_config()
+        model_cfg = config_data.get("model", {}) if isinstance(config_data, dict) else {}
+        if not isinstance(model_cfg, dict):
+            return None, None
+        configured_provider = _clean_session_model_provider(model_cfg.get("provider"))
+        configured_model = str(api_config.get_effective_default_model(config_data) or "").strip()
+    except Exception:
+        logger.debug("Failed to read configured default model/provider", exc_info=True)
+        return None, None
+    if not configured_model or not configured_provider:
+        return None, None
+    requested_model = str(model or "").strip()
+    if requested_model and requested_model != configured_model:
+        return None, None
+    return configured_model, configured_provider
+
+
 def _session_model_state_from_request(
     model: str | None,
     requested_provider: str | None,
@@ -8294,12 +8326,22 @@ def _session_model_state_from_request(
         if requested_provider is not None
         else None
     )
+    inferred_model, inferred_provider = _configured_default_session_model_state(
+        model_value,
+        requested_provider,
+    )
+    if model_value is None and inferred_model and inferred_provider:
+        model_value = inferred_model
+        provider = inferred_provider
     if model_value:
         _bare, explicit_provider = _split_provider_qualified_model(model_value)
         if explicit_provider:
             provider = explicit_provider
         elif requested_provider is None:
-            provider = _clean_session_model_provider(current_provider)
+            if model_value == inferred_model and inferred_provider:
+                provider = inferred_provider
+            else:
+                provider = _clean_session_model_provider(current_provider)
         model_value, provider, _changed = _resolve_compatible_session_model_state(
             model_value,
             provider,
@@ -11080,6 +11122,7 @@ from api.providers import (
     get_providers,
     get_provider_quota,
     get_provider_cost_history,
+    redeem_provider_quota_reset,
     provider_has_process_wakeup_recovery_credential,
     set_provider_key,
     remove_provider_key,
@@ -14370,6 +14413,21 @@ def handle_get(handler, parsed) -> bool:
             if diag:
                 diag.finish()
 
+    # ── Model manager (patch 04): enriched catalog for the settings Models
+    # section. GET serves picker rows joined with the gateway metadata cache
+    # (type/released/pricing/tags) so the manager can sort/filter without a
+    # browser-side gateway fetch. ?refresh=1 re-pulls the unauthenticated
+    # gateway feed server-side, refreshes the cache, and serves fresh.
+    if parsed.path == "/api/models/manager":
+        from api.config import get_model_manager_catalog
+        query = parse_qs(parsed.query or "")
+        refresh = (query.get("refresh", [""])[0] or "").strip().lower() in {"1", "true", "yes", "on"}
+        try:
+            return j(handler, get_model_manager_catalog(refresh=refresh))
+        except Exception as exc:
+            logger.warning("Model manager catalog failed: %s", exc)
+            return bad(handler, "model manager catalog unavailable", status=502)
+
     if parsed.path == "/api/models/live":
         from api.profiles import profile_env_for_active_request
         with profile_env_for_active_request("/api/models/live", logger_override=logger):
@@ -16186,6 +16244,20 @@ def handle_post(handler, parsed) -> bool:
         return bad(handler, f"unknown scope: {scope}", status=400)
 
     # ── Providers (POST) ──
+    if parsed.path == "/api/provider/quota/reset":
+        provider_id = str(body.get("provider") or "").strip().lower()
+        from api.profiles import profile_env_for_active_request
+        with profile_env_for_active_request("/api/provider/quota/reset", logger_override=logger):
+            return j(
+                handler,
+                redeem_provider_quota_reset(
+                    provider_id,
+                    body.get("credential_index"),
+                    body.get("credential_label"),
+                    force=body.get("force", False),
+                ),
+            )
+
     if parsed.path == "/api/providers":
         provider_id = (body.get("provider") or "").strip().lower()
         api_key = body.get("api_key")
@@ -16213,6 +16285,13 @@ def handle_post(handler, parsed) -> bool:
             return j(handler, apply_self_hosted_provider_setup(body))
         except ValueError as exc:
             return bad(handler, str(exc), 400)
+
+    if parsed.path == "/api/models/manager":
+        from api.model_manager import mutate
+        try:
+            return j(handler, mutate(body))
+        except ValueError as exc:
+            return bad(handler, str(exc), status=400)
 
     if parsed.path == "/api/models/refresh":
         provider_id = (body.get("provider") or "").strip().lower()
@@ -22384,16 +22463,40 @@ def _handle_live_models(handler, parsed):
         #      the background via _fetchLiveModels(), so the user never waits.
         if not ids:
             _ep = _OPENAI_COMPAT_ENDPOINTS.get(provider)
+            _providers_cfg = cfg.get("providers") or {}
+            _prov = _providers_cfg.get(provider, {}) if isinstance(_providers_cfg, dict) else {}
+            # Named providers are OpenAI-compatible endpoints too. Resolve their
+            # own endpoint/key, never the active model's credential: two Vercel
+            # accounts intentionally share a host but not authorization.
+            if not _ep and isinstance(_prov, dict):
+                _ep = str(
+                    _prov.get("api")
+                    or _prov.get("base_url")
+                    or _prov.get("url")
+                    or ""
+                ).strip().rstrip("/")
             if _ep:
                 try:
                     import urllib.request
-                    _providers_cfg = cfg.get("providers") or {}
-                    _prov = _providers_cfg.get(provider, {}) if isinstance(_providers_cfg, dict) else {}
                     # Only use a provider-scoped key.  A top-level model.api_key
                     # is safe here only when it belongs to the requested provider;
                     # otherwise /api/models/live?provider=<other> could forward
                     # the active provider's credential to the wrong third party.
                     _key = _prov.get("api_key") if isinstance(_prov, dict) else None
+                    if not _key and isinstance(_prov, dict):
+                        _key_env = str(
+                            _prov.get("key_env")
+                            or _prov.get("api_key_env")
+                            or ""
+                        ).strip()
+                        if _key_env:
+                            from api.config import _thread_local_env_value
+                            _key = _thread_local_env_value(_key_env)
+                    if _key:
+                        _key = str(_key).strip()
+                        if _key.startswith("${") and _key.endswith("}") and len(_key) > 3:
+                            from api.config import _thread_local_env_value
+                            _key = _thread_local_env_value(_key[2:-1].strip()).strip()
                     if not _key:
                         _model_cfg = cfg.get("model", {})
                         if isinstance(_model_cfg, dict):
@@ -22421,6 +22524,17 @@ def _handle_live_models(handler, parsed):
             ids = [m["id"] for m in _pm.get(provider, [])]
         if not ids:
             return _finish({"provider": provider, "models": [], "count": 0})
+
+        # Per-provider user exclusion (#7507): subtract hidden rows BEFORE the
+        # visibility cap so eligible later rows backfill the dropdown quota.
+        try:
+            from api.config import _model_exclusion_key, _model_excluded_ids_for_provider
+            _hidden = _model_excluded_ids_for_provider(provider)
+            if _hidden:
+                _hidden_keys = set().union(*(_model_exclusion_key(v) for v in _hidden))
+                ids = [mid for mid in ids if not (_model_exclusion_key(str(mid or "")) & _hidden_keys)]
+        except Exception:
+            logger.debug("Failed to apply user model exclusions for /api/models/live", exc_info=True)
 
         # Match the same dropdown visibility budget that /api/models uses so
         # background enrichment via _fetchLiveModels() does not re-append an
@@ -25658,6 +25772,7 @@ def _handle_cron_create(handler, body):
         toast_notifications = body.get("toast_notifications") is not False
         requested_model = body.get("model") or None
         requested_provider = body.get("provider") or None
+        requested_effort = body.get("reasoning_effort") or None
         job = create_job(
             prompt=body["prompt"],
             schedule=body["schedule"],
@@ -25666,6 +25781,7 @@ def _handle_cron_create(handler, body):
             skills=body.get("skills") or [],
             model=requested_model,
             provider=requested_provider,
+            reasoning_effort=requested_effort,
         )
         post_create_updates = {}
         if profile is not None:
@@ -25728,7 +25844,7 @@ def _handle_cron_update(handler, body):
                 continue
             if k == "profile":
                 updates[k] = _normalize_cron_profile_value(v)
-            elif k in ("model", "provider"):
+            elif k in ("model", "provider", "reasoning_effort"):
                 updates[k] = v if v else None
             elif v is not None:
                 updates[k] = v

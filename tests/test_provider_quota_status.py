@@ -1699,3 +1699,139 @@ def test_account_usage_semaphore_caps_concurrency(monkeypatch, tmp_path):
     finally:
         unblock.set()
         _restore_config(old_cfg, old_mtime)
+
+
+def test_named_provider_key_env_counts_as_credential(monkeypatch, tmp_path):
+    """Named provider config must drive both status and API-key lookup."""
+    import api.providers as providers
+
+    monkeypatch.setattr(providers, "_get_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(providers, "_thread_local_env_value", lambda name: os.environ.get(name))
+    monkeypatch.delenv("VERCEL_PLAYGROUND_TEST_KEY", raising=False)
+    (tmp_path / ".env").write_text(
+        "VERCEL_PLAYGROUND_TEST_KEY=provider-key\n",
+        encoding="utf-8",
+    )
+    cfg = {
+        "model": {"provider": "vercel-playground"},
+        "providers": {
+            "vercel-playground": {
+                "key_env": "VERCEL_PLAYGROUND_TEST_KEY",
+            },
+        },
+    }
+    monkeypatch.setattr(providers, "get_config", lambda: cfg)
+
+    assert providers._provider_has_key("vercel-playground") is True
+    assert providers._get_provider_api_key("vercel-playground") == "provider-key"
+
+
+def test_codex_pool_reset_uses_explicit_subscription_and_never_returns_credential(monkeypatch):
+    """A reset request must target the displayed pool row, not the active cursor."""
+    import api.providers as providers
+
+    agent_mod = types.ModuleType("agent")
+    agent_mod.__path__ = []
+    account_usage_mod = types.ModuleType("agent.account_usage")
+    credential_pool_mod = types.ModuleType("agent.credential_pool")
+    entries = [
+        SimpleNamespace(
+            label="Beth-Codex",
+            runtime_api_key="secret-beth-token",
+            runtime_base_url="https://chatgpt.com/backend-api/codex",
+        ),
+        SimpleNamespace(
+            label="Brandon-Codex",
+            runtime_api_key="secret-brandon-token",
+            runtime_base_url="https://chatgpt.com/backend-api/codex",
+        ),
+    ]
+    seen = {}
+
+    class FakePool:
+        def entries(self):
+            return entries
+
+    def fake_load_pool(provider):
+        assert provider == "openai-codex"
+        return FakePool()
+
+    def fake_redeem(*, base_url, api_key, force):
+        seen.update(base_url=base_url, api_key=api_key, force=force)
+        return SimpleNamespace(
+            status="reset",
+            message="reset ok",
+            available_count=1,
+            windows_reset=2,
+        )
+
+    credential_pool_mod.load_pool = fake_load_pool
+    account_usage_mod.redeem_codex_reset_credit = fake_redeem
+    monkeypatch.setitem(sys.modules, "agent", agent_mod)
+    monkeypatch.setitem(sys.modules, "agent.credential_pool", credential_pool_mod)
+    monkeypatch.setitem(sys.modules, "agent.account_usage", account_usage_mod)
+    monkeypatch.setattr(providers, "invalidate_account_usage_status_cache", lambda *_args: None)
+
+    result = providers.redeem_provider_quota_reset(
+        "openai-codex",
+        2,
+        "Brandon-Codex",
+    )
+
+    assert result == {
+        "ok": True,
+        "provider": "openai-codex",
+        "credential_index": 2,
+        "credential_label": "Brandon-Codex",
+        "status": "reset",
+        "message": "reset ok",
+        "available_count": 1,
+        "windows_reset": 2,
+    }
+    assert seen == {
+        "base_url": "https://chatgpt.com/backend-api/codex",
+        "api_key": "secret-brandon-token",
+        "force": False,
+    }
+    assert "token" not in json.dumps(result).lower()
+
+
+def test_account_usage_transport_preserves_banked_reset_count():
+    """The WebUI serializer must retain reset credits from the probe worker."""
+    import api.providers as providers
+
+    snapshot = providers._account_usage_payload_to_snapshot({
+        "provider": "openai-codex",
+        "source": "usage_api_pool",
+        "title": "Account limits",
+        "plan": "Plus",
+        "windows": [],
+        "details": ["1/2 credentials available", "2 banked reset credits"],
+        "available": True,
+        "unavailable_reason": None,
+        "fetched_at": "2030-03-17T12:30:00Z",
+        "banked_resets": 2,
+        "pool": {
+            "total_credentials": 2,
+            "credentials": [{"label": "Beth-Codex", "banked_resets": 2}],
+        },
+    })
+
+    result = providers._serialize_account_usage_snapshot(snapshot)
+
+    assert result["banked_resets"] == 2
+    assert result["pool"]["credentials"][0]["banked_resets"] == 2
+
+
+def test_provider_settings_patch_fetches_codex_pool_and_exposes_reset_control():
+    """Frontend contract covers non-active Codex fetches and reset targeting."""
+    panels = (ROOT / "static" / "panels.js").read_text(encoding="utf-8")
+    routes = (ROOT / "api" / "routes.py").read_text(encoding="utf-8")
+
+    assert "_fetchProviderQuotaStatus(false,'openai-codex')" in panels
+    assert "data-provider-quota-reset" in panels
+    assert "Redeem 1 reset credit (${bankedResets} available)" in panels
+    assert "Redeem ${bankedResets} reset credit" not in panels
+    assert "credential_index:index" in panels
+    assert "'/api/provider/quota/reset'" in panels
+    assert 'parsed.path == "/api/provider/quota/reset"' in routes

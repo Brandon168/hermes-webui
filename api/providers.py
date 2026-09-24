@@ -76,6 +76,31 @@ def _custom_provider_name_matches(provider_id: str, name: object) -> bool:
         candidates.add(slug)
     return pid in candidates
 
+
+def _configured_provider_key_env(provider_id: str, config_data: dict | None = None) -> str | None:
+    """Return the env-var name declared by a named provider configuration."""
+    pid = str(provider_id or "").strip().lower()
+    if not pid:
+        return None
+    cfg = config_data if isinstance(config_data, dict) else get_config()
+    providers_cfg = cfg.get("providers") if isinstance(cfg, dict) else None
+    if isinstance(providers_cfg, dict):
+        for raw_id, entry in providers_cfg.items():
+            if str(raw_id or "").strip().lower() != pid or not isinstance(entry, dict):
+                continue
+            key_env = str(entry.get("key_env") or "").strip()
+            if key_env:
+                return key_env
+    custom_providers = cfg.get("custom_providers") if isinstance(cfg, dict) else None
+    if isinstance(custom_providers, list):
+        for entry in custom_providers:
+            if not isinstance(entry, dict) or not _custom_provider_name_matches(pid, entry.get("name")):
+                continue
+            key_env = str(entry.get("key_env") or "").strip()
+            if key_env:
+                return key_env
+    return None
+
 _OPENROUTER_KEY_URL = "https://openrouter.ai/api/v1/key"
 _PROVIDER_QUOTA_TIMEOUT_SECONDS = 3.0
 _ACCOUNT_USAGE_SUBPROCESS_TIMEOUT_SECONDS = 35.0
@@ -221,6 +246,9 @@ def _snapshot_payload(snapshot):
         "unavailable_reason": getattr(snapshot, "unavailable_reason", None),
         "fetched_at": _iso(getattr(snapshot, "fetched_at", None)),
     }
+    banked_resets = _snapshot_banked_resets(snapshot)
+    if banked_resets > 0:
+        payload["banked_resets"] = banked_resets
     pool = getattr(snapshot, "pool", None)
     if isinstance(pool, dict):
         payload["pool"] = pool
@@ -329,6 +357,18 @@ def _entry_value(entry, *names):
     return None
 
 
+def _codex_banked_resets(payload):
+    if not isinstance(payload, dict):
+        return 0
+    reset_credits = payload.get("rate_limit_reset_credits")
+    if not isinstance(reset_credits, dict):
+        return 0
+    count = _number(reset_credits.get("available_count"))
+    if count is None:
+        return 0
+    return max(0, int(count))
+
+
 def _codex_snapshot_from_usage_payload(payload):
     if not isinstance(payload, dict):
         payload = {}
@@ -350,6 +390,7 @@ def _codex_snapshot_from_usage_payload(payload):
             detail=None,
         ))
 
+    banked_resets = _codex_banked_resets(payload)
     details = []
     credits = payload.get("credits")
     if isinstance(credits, dict) and credits.get("has_credits"):
@@ -366,10 +407,18 @@ def _codex_snapshot_from_usage_payload(payload):
         plan=_title_case_slug(payload.get("plan_type")),
         windows=tuple(windows),
         details=tuple(details),
-        available=bool(windows or details),
+        available=bool(windows or details or banked_resets),
         unavailable_reason=None,
         fetched_at=datetime.now(timezone.utc),
+        banked_resets=banked_resets,
     )
+
+
+def _snapshot_banked_resets(snapshot):
+    explicit = _number(getattr(snapshot, "banked_resets", None))
+    if explicit is not None:
+        return max(0, int(explicit))
+    return _codex_banked_resets(getattr(snapshot, "raw", None))
 
 
 def _snapshot_windows_payload(snapshot):
@@ -543,6 +592,10 @@ def _codex_pool_snapshot(entries, rows, queried):
         plan = row.get("plan")
         if plan and plan not in plans:
             plans.append(plan)
+    banked_resets = sum(
+        max(0, int(_number(row.get("banked_resets")) or 0))
+        for row in rows
+    )
     best_windows = _best_remaining_by_window(rows)
     pool = {
         "total_credentials": len(entries),
@@ -555,6 +608,8 @@ def _codex_pool_snapshot(entries, rows, queried):
         "best_remaining_by_window": best_windows,
         "credentials": rows,
     }
+    if banked_resets > 0:
+        pool["banked_resets"] = banked_resets
     details = [str(len(available_rows)) + "/" + str(len(entries)) + " credentials available"]
     if exhausted_rows:
         details.append(str(len(exhausted_rows)) + " exhausted")
@@ -562,6 +617,8 @@ def _codex_pool_snapshot(entries, rows, queried):
         details.append(str(len(failed_rows)) + " failed to load")
     if plans:
         details.append("Plans: " + ", ".join(plans))
+    if banked_resets > 0:
+        details.append(str(banked_resets) + " banked reset credits")
     plan = plans[0] if len(plans) == 1 else None
     windows = tuple(
         SimpleNamespace(
@@ -583,6 +640,7 @@ def _codex_pool_snapshot(entries, rows, queried):
         unavailable_reason=None if available_rows else "No Codex pool credentials returned available account limits.",
         fetched_at=datetime.now(timezone.utc),
         pool=pool,
+        banked_resets=banked_resets,
     )
 
 
@@ -614,6 +672,7 @@ def _probe_codex_pool_entry(item):
         reason = str(exc)
     windows = _snapshot_windows_payload(snapshot) if snapshot is not None else []
     details = _snapshot_details_payload(snapshot) if snapshot is not None else []
+    banked_resets = _snapshot_banked_resets(snapshot) if snapshot is not None else 0
     snapshot_available = _snapshot_available(snapshot)
     status = "available" if snapshot_available else "unavailable"
     row = {
@@ -625,6 +684,8 @@ def _probe_codex_pool_entry(item):
         "unavailable_reason": None if snapshot_available else _safe_unavailable_reason(reason or getattr(snapshot, "unavailable_reason", None)),
         "fetched_at": _iso(getattr(snapshot, "fetched_at", None)) if snapshot is not None else None,
     }
+    if banked_resets > 0:
+        row["banked_resets"] = banked_resets
     return index, row, did_query_count
 
 
@@ -743,6 +804,10 @@ _PROVIDER_ENV_VAR: dict[str, str] = {
     # flip to "no key" after upgrading.
     "lmstudio": "LM_API_KEY",
     "nvidia": "NVIDIA_API_KEY",
+    # Named Vercel Gateway providers keep their credential pointer in
+    # config.yaml under providers.<name>.key_env; expose Brandon's key to
+    # the WebUI status card as well as the runtime.
+    "vercel-brandon-pro": "VERCEL_BRANDON_PRO_API_KEY",
 }
 
 # Read-only legacy env-var aliases.  When `_provider_has_key(pid)` looks up its
@@ -1276,27 +1341,34 @@ def _provider_has_key(provider_id: str) -> bool:
     4. ``config.yaml → providers.<id>.api_key``
     5. ``config.yaml → custom_providers[].api_key`` (for custom providers)
     """
-    env_var = _provider_env_var_for(provider_id)
-    if env_var:
-        env_path = _get_hermes_home() / ".env"
-        env_values = _load_env_file(env_path)
+    cfg = get_config()
+    env_vars: list[str] = []
+    for candidate in (
+        _provider_env_var_for(provider_id),
+        _configured_provider_key_env(provider_id, cfg),
+    ):
+        if candidate and candidate not in env_vars:
+            env_vars.append(candidate)
+    env_path = _get_hermes_home() / ".env"
+    env_values = _load_env_file(env_path)
+    for env_var in env_vars:
         env_file_value = env_values.get(env_var)
         if _provider_value_counts_as_api_key(provider_id, env_file_value):
             return True
         env_value = _thread_local_env_value(env_var)
         if _provider_value_counts_as_api_key(provider_id, env_value):
             return True
-        # Fall back to legacy env-var aliases (e.g. lmstudio's pre-#1500
-        # LMSTUDIO_API_KEY name) so existing users don't lose detection
-        # after an env-var rename.  See _PROVIDER_ENV_VAR_ALIASES.
-        for alias in _PROVIDER_ENV_VAR_ALIASES.get(provider_id, ()) or ():
-            if _provider_value_counts_as_api_key(provider_id, env_values.get(alias)):
-                return True
-            if _provider_value_counts_as_api_key(provider_id, _thread_local_env_value(alias)):
-                return True
+    # Fall back to legacy env-var aliases (e.g. lmstudio's pre-#1500
+    # LMSTUDIO_API_KEY name) so existing users don't lose detection
+    # after an env-var rename.  See _PROVIDER_ENV_VAR_ALIASES.
+    for alias in _PROVIDER_ENV_VAR_ALIASES.get(provider_id, ()) or ():
+        if _provider_value_counts_as_api_key(provider_id, env_values.get(alias)):
+            return True
+        if _provider_value_counts_as_api_key(provider_id, _thread_local_env_value(alias)):
+            return True
     # Check credential pool — covers custom providers registered via
     # `hermes auth add` which store keys in auth.json (not config.yaml).
-    # Must be outside the `if env_var:` block above: custom providers
+    # Must be outside the env-var block above: custom providers
     # (custom:bothub, etc.) have no env var, so that block is skipped.
     # Uses the cached _has_explicit_pool_credentials helper which also
     # filters gh-cli / GITHUB_TOKEN ambient entries so copilot doesn't
@@ -1308,7 +1380,6 @@ def _provider_has_key(provider_id: str) -> bool:
     except ImportError:
         pass
 
-    cfg = get_config()
     # Check model.api_key — only match if this provider is the active one.
     # Previously this checked globally, causing all providers to show
     # "configured" when the active provider had a top-level api_key.
@@ -1339,25 +1410,31 @@ def _provider_has_key(provider_id: str) -> bool:
 def _get_provider_api_key(provider_id: str) -> str | None:
     """Return a configured provider API key without exposing it to callers."""
     provider_id = (provider_id or "").strip().lower()
-    env_var = _provider_env_var_for(provider_id)
-    if env_var:
-        env_path = _get_hermes_home() / ".env"
-        env_values = _load_env_file(env_path)
+    cfg = get_config()
+    env_vars: list[str] = []
+    for candidate in (
+        _provider_env_var_for(provider_id),
+        _configured_provider_key_env(provider_id, cfg),
+    ):
+        if candidate and candidate not in env_vars:
+            env_vars.append(candidate)
+    env_path = _get_hermes_home() / ".env"
+    env_values = _load_env_file(env_path)
+    for env_var in env_vars:
         env_file_value = env_values.get(env_var)
         if _provider_value_counts_as_api_key(provider_id, env_file_value):
             return str(env_file_value).strip() or None
         env_value = _thread_local_env_value(env_var)
         if _provider_value_counts_as_api_key(provider_id, env_value):
             return str(env_value).strip() or None
-        for alias in _PROVIDER_ENV_VAR_ALIASES.get(provider_id, ()) or ():
-            alias_file_value = env_values.get(alias)
-            if _provider_value_counts_as_api_key(provider_id, alias_file_value):
-                return str(alias_file_value).strip() or None
-            alias_value = _thread_local_env_value(alias)
-            if _provider_value_counts_as_api_key(provider_id, alias_value):
-                return str(alias_value).strip() or None
+    for alias in _PROVIDER_ENV_VAR_ALIASES.get(provider_id, ()) or ():
+        alias_file_value = env_values.get(alias)
+        if _provider_value_counts_as_api_key(provider_id, alias_file_value):
+            return str(alias_file_value).strip() or None
+        alias_value = _thread_local_env_value(alias)
+        if _provider_value_counts_as_api_key(provider_id, alias_value):
+            return str(alias_value).strip() or None
 
-    cfg = get_config()
     model_cfg = cfg.get("model", {})
     if isinstance(model_cfg, dict):
         active_provider = str(model_cfg.get("provider") or "").strip().lower()
@@ -1592,6 +1669,9 @@ def _serialize_account_usage_snapshot(snapshot: Any) -> dict[str, Any] | None:
         "unavailable_reason": unavailable_reason,
         "fetched_at": _isoformat_utc(getattr(snapshot, "fetched_at", None)),
     }
+    banked_resets = _quota_number(getattr(snapshot, "banked_resets", None))
+    if banked_resets is not None and banked_resets > 0:
+        result["banked_resets"] = int(banked_resets)
     pool = getattr(snapshot, "pool", None)
     if isinstance(pool, dict):
         result["pool"] = pool
@@ -1677,6 +1757,7 @@ def _account_usage_payload_to_snapshot(payload: Any) -> Any:
         unavailable_reason=payload.get("unavailable_reason"),
         fetched_at=payload.get("fetched_at"),
         pool=payload.get("pool") if isinstance(payload.get("pool"), dict) else None,
+        banked_resets=payload.get("banked_resets", 0),
     )
 
 
@@ -2121,6 +2202,123 @@ def _provider_account_usage_status(provider: str, display_name: str, *, refresh:
         "account_limits": account_limits,
         "message": message,
     }
+
+
+def _codex_reset_entry_label(entry: Any, index: int) -> str:
+    raw = getattr(entry, "label", None) or getattr(entry, "source", None)
+    label = " ".join(str(raw or f"Credential {index}").split()).strip()
+    return label[:64] or f"Credential {index}"
+
+
+def _codex_pool_entry_for_reset(
+    credential_index: Any,
+    credential_label: Any = None,
+) -> tuple[int, Any, str]:
+    if isinstance(credential_index, bool):
+        raise ValueError("credential_index must be a pool position")
+    try:
+        index = int(str(credential_index).strip())
+    except (TypeError, ValueError) as exc:
+        raise ValueError("credential_index must be a pool position") from exc
+    if index < 1:
+        raise ValueError("credential_index must be a positive pool position")
+
+    from agent.credential_pool import load_pool
+
+    entries = list(load_pool("openai-codex").entries())
+    if index > len(entries):
+        raise ValueError("That subscription is no longer in the Codex pool; refresh the page")
+    entry = entries[index - 1]
+    label = _codex_reset_entry_label(entry, index)
+    supplied_label = str(credential_label or "").strip()
+    if supplied_label and supplied_label != label:
+        raise ValueError("The Codex pool changed; refresh the page before retrying")
+    return index, entry, label
+
+
+def redeem_provider_quota_reset(
+    provider_id: str | None,
+    credential_index: Any,
+    credential_label: Any = None,
+    *,
+    force: Any = False,
+) -> dict[str, Any]:
+    """Redeem one provider-issued reset credit for a selected pool entry.
+
+    The action is deliberately narrow: it is only available for an explicitly
+    selected openai-codex pool entry, and the agent-side reset helper decides
+    whether the account is eligible. No credential material is returned.
+    """
+    provider = (provider_id or "").strip().lower()
+    if provider != "openai-codex":
+        return {
+            "ok": False,
+            "provider": provider or None,
+            "status": "unsupported",
+            "message": "Reset credits are not supported for this provider.",
+        }
+    try:
+        index, entry, label = _codex_pool_entry_for_reset(
+            credential_index,
+            credential_label,
+        )
+    except ValueError as exc:
+        return {
+            "ok": False,
+            "provider": provider,
+            "status": "invalid_target",
+            "message": str(exc),
+        }
+    try:
+        base_url = str(getattr(entry, "runtime_base_url", "") or "").strip() or None
+        api_key = str(getattr(entry, "runtime_api_key", "") or "").strip()
+    except Exception:
+        base_url = None
+        api_key = ""
+    if not api_key:
+        return {
+            "ok": False,
+            "provider": provider,
+            "credential_index": index,
+            "credential_label": label,
+            "status": "unavailable",
+            "message": "This Codex subscription has no usable runtime credential.",
+        }
+
+    force_flag = force is True or str(force).strip().lower() in {"1", "true", "yes"}
+    try:
+        from agent.account_usage import redeem_codex_reset_credit
+
+        reset = redeem_codex_reset_credit(
+            base_url=base_url,
+            api_key=api_key,
+            force=force_flag,
+        )
+        status = str(getattr(reset, "status", "unknown") or "unknown")
+        try:
+            invalidate_account_usage_status_cache(provider)
+        except Exception:
+            logger.debug("Failed to invalidate account usage cache after Codex reset", exc_info=True)
+        return {
+            "ok": status in {"reset", "already_redeemed"},
+            "provider": provider,
+            "credential_index": index,
+            "credential_label": label,
+            "status": status,
+            "message": str(getattr(reset, "message", "") or "").strip() or None,
+            "available_count": getattr(reset, "available_count", None),
+            "windows_reset": getattr(reset, "windows_reset", None),
+        }
+    except Exception:
+        logger.debug("Codex reset action failed", exc_info=True)
+        return {
+            "ok": False,
+            "provider": provider,
+            "credential_index": index,
+            "credential_label": label,
+            "status": "unavailable",
+            "message": "The Codex reset action is unavailable in this runtime.",
+        }
 
 
 def get_provider_quota(provider_id: str | None = None, *, refresh: bool = False) -> dict[str, Any]:

@@ -73,7 +73,7 @@ def test_ui_js_mirror_has_trailing_empty_guard():
     """Frontend _normalizeConfiguredModelKey must mirror the backend guard."""
     # The colon branch now uses indexOf(':',1)+slice to strip only @provider: prefix
     assert "indexOf(':',1)" in UI_JS, "ui.js no longer uses indexOf-slice pattern for colon branch"
-    snippet = UI_JS[UI_JS.find("function _normalizeConfiguredModelKey"):UI_JS.find("function _normalizeConfiguredModelKey") + 1800]
+    snippet = UI_JS[UI_JS.find("function _normalizeConfiguredModelKey"):UI_JS.find("function _normalizeConfiguredModelKey") + 3000]
     assert "cand||s" in snippet, "ui.js missing trailing-empty guard `||s` fallback on colon branch"
     # The slash branch now uses replace(/^[^/]+\//, '') instead of split('/').pop()
     # to preserve multi-slash vendor hierarchy (#3360).  Verify the new pattern

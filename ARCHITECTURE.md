@@ -1808,7 +1808,7 @@ server.py line count progression: 1778 (S1) -> 1042 (S5) -> 903 (S6)
 
 #### New Endpoints
 
-    POST /api/crons/create   {prompt, schedule, name?, deliver?, skills?, model?}
+    POST /api/crons/create   {prompt, schedule, name?, deliver?, skills?, model?, provider?, reasoning_effort?}
                              -> {ok: true, job: {...}} or 400 on invalid schedule/missing fields.
                              Uses cron.jobs.create_job() directly.
     GET  /api/session/export ?session_id=X

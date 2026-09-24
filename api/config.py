@@ -2381,6 +2381,355 @@ def _openrouter_model_display_name(model_id: str) -> str:
     return name or model_id
 
 
+def _model_storage_id(entry_id: object) -> str:
+    """Return a model id without a picker routing prefix.
+
+    Routing prefixes identify the provider carrying a row; they are not part of
+    the model identity used by global visibility intent or gateway metadata.
+    Variant text (``-fast``, ``-pro``, dates, and ``:free``) is preserved.
+    """
+    mid = str(entry_id or "").strip()
+    if mid.startswith("@") and ":" in mid:
+        mid = mid.split(":", 1)[1].strip()
+    return mid
+
+
+def _model_visibility_key(entry_id: object) -> str:
+    """Return the comparison key for one exact model identity."""
+    return _model_storage_id(entry_id).lower()
+
+
+def _model_ids_match(left: object, right: object) -> bool:
+    """Compare model identities without collapsing distinct variants."""
+    left_key = _model_visibility_key(left)
+    right_key = _model_visibility_key(right)
+    return bool(left_key and left_key == right_key)
+
+
+def _normalise_model_id_list(values) -> list[str]:
+    """Normalize model IDs while preserving exact variant spellings."""
+    if not isinstance(values, (list, tuple, set, frozenset)):
+        return []
+    result: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        model_id = _model_storage_id(value)
+        key = _model_visibility_key(model_id)
+        if model_id and key not in seen:
+            seen.add(key)
+            result.append(model_id)
+    return result
+
+
+def _stored_provider_id(value: object) -> str:
+    """Return a stable provider key, retaining unknown providers."""
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    return _canonicalise_provider_id(raw) or raw.lower().replace("_", "-")
+
+
+def _normalise_models_hidden(raw) -> dict[str, list[str]]:
+    """Normalize the materialized provider -> hidden model map."""
+    if isinstance(raw, list):
+        # Keep compatibility with the short-lived legacy list shape. It is
+        # intentionally represented under a sentinel and is not expanded into
+        # guessed provider groups.
+        ids = _normalise_model_id_list(raw)
+        return {"*": ids} if ids else {}
+    if not isinstance(raw, dict):
+        return {}
+    result: dict[str, list[str]] = {}
+    for raw_provider, raw_ids in raw.items():
+        provider = _stored_provider_id(raw_provider)
+        if not provider or not isinstance(raw_ids, list):
+            continue
+        result[provider] = _normalise_model_id_list(raw_ids)
+    return result
+
+
+def _normalise_models_global_hidden(raw) -> list[str]:
+    """Normalize explicit global-hide intent without inferring it from old hides."""
+    return _normalise_model_id_list(raw)
+
+
+def _normalise_models_provider_overrides(raw) -> dict[str, dict[str, str]]:
+    """Normalize explicit provider policy, retaining absent/unknown providers."""
+    if not isinstance(raw, dict):
+        return {}
+    result: dict[str, dict[str, str]] = {}
+    for raw_model, raw_providers in raw.items():
+        model_id = _model_storage_id(raw_model)
+        model_key = _model_visibility_key(model_id)
+        if not model_id or not model_key or not isinstance(raw_providers, dict):
+            continue
+        model_store_key = next(
+            (key for key in result if _model_visibility_key(key) == model_key),
+            model_id,
+        )
+        states = result.setdefault(model_store_key, {})
+        for raw_provider, raw_state in raw_providers.items():
+            provider = _stored_provider_id(raw_provider)
+            state = str(raw_state or "").strip().lower()
+            if provider and state in {"show", "hide"}:
+                states[provider] = state
+    return result
+
+
+def _models_global_hidden_ids(stored: dict | None = None) -> list[str]:
+    """Read explicit global-hide intent without inferring it from old hides."""
+    if not isinstance(stored, dict):
+        try:
+            stored = _read_raw_settings_file()
+        except Exception:
+            stored = {}
+    raw = stored.get("models_global_hidden") if isinstance(stored, dict) else None
+    return _normalise_models_global_hidden(raw)
+
+
+def _models_provider_overrides(stored: dict | None = None) -> dict[str, dict[str, str]]:
+    """Read explicit provider overrides, retaining entries for absent providers."""
+    if not isinstance(stored, dict):
+        try:
+            stored = _read_raw_settings_file()
+        except Exception:
+            stored = {}
+    raw = stored.get("models_provider_overrides") if isinstance(stored, dict) else None
+    normalized = _normalise_models_provider_overrides(raw)
+    return {
+        _model_visibility_key(model_id): dict(states)
+        for model_id, states in normalized.items()
+        if states
+    }
+
+
+def _model_provider_override(
+    stored: dict | None, model_id: object, provider_id: object
+) -> str | None:
+    """Return an explicit ``show``/``hide`` override for one provider."""
+    overrides = _models_provider_overrides(stored)
+    model_overrides = overrides.get(_model_visibility_key(model_id), {})
+    provider = _canonicalise_provider_id(provider_id) or str(provider_id or "").strip().lower()
+    state = model_overrides.get(provider)
+    return state if state in {"show", "hide"} else None
+
+
+def _effective_model_exclusions_for_provider(
+    provider_id: object,
+    stored: dict | None = None,
+) -> set[str]:
+    """Return effective picker exclusions from one settings snapshot."""
+    if not isinstance(stored, dict):
+        try:
+            stored = _read_raw_settings_file()
+        except Exception:
+            stored = {}
+    pid = _stored_provider_id(provider_id)
+    hidden_map = _normalise_models_hidden(stored.get("models_hidden"))
+    out: set[str] = set(hidden_map.get(pid, []))
+    # A legacy list was an all-provider exclusion. Do not expand it into the
+    # stored map, but keep its historical picker behavior.
+    out.update(hidden_map.get("*", []))
+
+    global_hidden = _normalise_models_global_hidden(stored.get("models_global_hidden"))
+    overrides = _models_provider_overrides(stored)
+    for model_id in global_hidden:
+        if overrides.get(_model_visibility_key(model_id), {}).get(pid) != "show":
+            out.add(model_id)
+    for model_key, provider_states in overrides.items():
+        state = provider_states.get(pid)
+        if state == "hide":
+            out.add(model_key)
+        elif state == "show":
+            out = {value for value in out if not _model_ids_match(value, model_key)}
+    return out
+
+
+def _model_excluded_ids_for_provider(provider_id: str) -> set[str]:
+    """Return effective picker exclusions for one provider."""
+    return _effective_model_exclusions_for_provider(provider_id)
+
+
+def _model_exclusion_key(entry_id: str) -> set[str]:
+    """Return normalized id shapes one picker row can match."""
+    mid = str(entry_id or "").strip()
+    if not mid:
+        return set()
+    keys = {_model_visibility_key(mid)}
+    if mid.startswith("@") and ":" in mid:
+        _prov, _bare = mid[1:].split(":", 1)
+        if _bare.strip():
+            keys.add(_model_visibility_key(_bare))
+    return keys
+
+
+def _apply_user_model_exclusions(groups: list, *, enabled: bool = True) -> int:
+    """Drop effective user-hidden rows from picker groups, in place."""
+    if not enabled:
+        return 0
+    removed = 0
+    for group in groups or []:
+        if not isinstance(group, dict):
+            continue
+        pid = str(group.get("provider_id") or "").strip()
+        hidden = _model_excluded_ids_for_provider(pid)
+        if not hidden:
+            continue
+        for bucket in ("models", "extra_models"):
+            rows = group.get(bucket)
+            if not isinstance(rows, list):
+                continue
+            kept = []
+            for row in rows:
+                if not isinstance(row, dict):
+                    kept.append(row)
+                    continue
+                entry_id = str(row.get("id") or "").strip()
+                if entry_id and any(_model_ids_match(entry_id, value) for value in hidden):
+                    removed += 1
+                    continue
+                kept.append(row)
+            group[bucket] = kept
+    return removed
+
+
+# ── Model manager metadata (patch 04) ────────────────────────────────────────
+#
+# The settings Models section joins picker rows with AI Gateway metadata
+# (type / released / pricing / tags) so it can sort newest-first and show
+# decision columns without a browser-side gateway fetch. The feed is the
+# public unauthenticated GET https://ai-gateway.vercel.sh/v1/models; the
+# trimmed snapshot lives in settings.json ``models_meta`` keyed by
+# lower-cased bare id (``creator/model``), so it applies to a model
+# regardless of which provider group carries it. Exact-id join only: variant
+# suffixes (-fast, -pro, -mini, dates) are distinct rows and never inherit.
+
+_GATEWAY_MODELS_URL = "https://ai-gateway.vercel.sh/v1/models"
+_GATEWAY_MODELS_TIMEOUT_S = 15.0
+# Non-chat gateway types hidden from the picker when the manager's non-chat
+# rule is active. Kept as a constant (not user config) so the rule is
+# reviewable in one place.
+_NON_CHAT_GATEWAY_TYPES = {
+    "image", "video", "embedding", "reranking", "speech", "transcription",
+    "realtime", "evaluation",
+}
+
+
+def _manager_bare_id(entry_id: str) -> str:
+    """Return the lower-cased bare id used as the models_meta join key."""
+    mid = str(entry_id or "").strip()
+    if mid.startswith("@") and ":" in mid:
+        mid = mid.split(":", 1)[1]
+    return mid.strip().lower()
+
+
+def _manager_release_value(value):
+    """Keep the gateway's released date without inventing one from created."""
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return int(value)
+    text = str(value).strip()
+    return text or None
+
+
+def refresh_gateway_models_meta(*, timeout: float = _GATEWAY_MODELS_TIMEOUT_S) -> dict:
+    """Fetch and persist the public Vercel gateway metadata snapshot."""
+    import urllib.request as _urlreq
+
+    req = _urlreq.Request(_GATEWAY_MODELS_URL, headers={"Accept": "application/json"})
+    with _urlreq.urlopen(req, timeout=timeout) as resp:  # nosec B310
+        payload = json.loads(resp.read().decode("utf-8", errors="replace"))
+    rows = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(rows, list):
+        raise ValueError("gateway feed: missing data[]")
+    meta: dict[str, dict] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        mid = str(row.get("id") or "").strip().lower()
+        if not mid:
+            continue
+        entry: dict = {
+            "type": str(row.get("type") or "").strip().lower() or None,
+            # The manager exposes release dates only. ``created`` is deliberately
+            # not copied: it is an availability/record-creation timestamp, not
+            # evidence that a model was released on that date.
+            "released": _manager_release_value(row.get("released")),
+        }
+        pricing = row.get("pricing")
+        entry["pricing"] = copy.deepcopy(pricing) if isinstance(pricing, dict) else None
+        tags = row.get("tags")
+        entry["tags"] = [str(x) for x in tags if str(x or "").strip()] if isinstance(tags, list) else None
+        name = str(row.get("name") or "").strip()
+        entry["name"] = name or None
+        meta[mid] = entry
+    saved = save_settings({"models_meta": meta})
+    stored = saved.get("models_meta") if isinstance(saved, dict) else None
+    return {"ok": True, "models": len(stored) if isinstance(stored, dict) else len(meta)}
+
+
+def _load_gateway_models_meta() -> dict:
+    """Return the cached models_meta snapshot (never fetches)."""
+    try:
+        stored = _read_raw_settings_file().get("models_meta")
+    except Exception:
+        return {}
+    return dict(stored) if isinstance(stored, dict) else {}
+
+
+def _manager_meta_for(
+    entry_id: str,
+    meta: dict,
+    provider_id: str | None = None,
+) -> dict | None:
+    """Join metadata by exact model identity, with explicit vendor aliases.
+
+    The public gateway feed namespaces every id (``openai/gpt-…``,
+    ``anthropic/claude-…``) while Codex and CommandCode rows carry the bare
+    form (``gpt-6-luna``). The alias restores the join without inheriting
+    across variants: ``-fast``, ``-pro``, dates, and ``:free`` stay exact.
+    """
+    if not isinstance(meta, dict):
+        return None
+    key = _manager_bare_id(entry_id)
+    hit = meta.get(key)
+    if isinstance(hit, dict):
+        return copy.deepcopy(hit)
+
+    # Bare rows omit the vendor namespace while the public gateway feed uses
+    # it. This is an explicit per-provider alias, not suffix inheritance:
+    # variants still remain exact.
+    provider = _stored_provider_id(provider_id)
+    namespaced: str | None = None
+    if "/" not in key:
+        if provider == "openai-codex":
+            # Codex rows historically omit the ``openai/`` namespace.
+            namespaced = f"openai/{key}"
+        elif provider in {
+            "commandcode",
+            "commandcode-chat",
+            "commandcode-anthropic",
+            "commandcode-claude",
+        }:
+            # CommandCode serves bare multi-vendor wire ids: gpt-* is OpenAI,
+            # claude-* is Anthropic. Anything else stays unaliased.
+            if key.startswith("gpt-"):
+                namespaced = f"openai/{key}"
+            elif key.startswith("claude-"):
+                namespaced = f"anthropic/{key}"
+    if namespaced:
+        hit = meta.get(namespaced)
+        if isinstance(hit, dict):
+            return copy.deepcopy(hit)
+    return None
+
+
+def get_model_manager_catalog(*, refresh: bool = False) -> dict:
+    from api.model_manager import catalog
+    return catalog(refresh=refresh)
+
+
 def _split_picker_overflow_models(
     ordered_models: list[dict],
     *,
@@ -2437,7 +2786,7 @@ def _apply_provider_prefix(
     return result
 
 
-def _deduplicate_model_ids(groups: list[dict]) -> None:
+def _deduplicate_model_ids(groups: list[dict], *, include_hidden: bool = False) -> None:
     """Ensure every model ID across groups is globally unique.
 
     When multiple providers expose the same model ID (either bare names like
@@ -2465,6 +2814,15 @@ def _deduplicate_model_ids(groups: list[dict]) -> None:
 
     Operates in-place on *groups*.
     """
+
+    # Per-provider user exclusion (#7507): drop hidden models BEFORE the id
+    # collision pass so removed rows cannot claim the bare-id "first
+    # occurrence" slot and cannot appear in overflow buckets. Note this is a
+    # plain pass — the in-use/default preservation variant with the same name
+    # lives at the catalog assembly exit (see _build_available_models_uncached
+    # and _static_models_catalog_without_live_probes).
+    _apply_user_model_exclusions(groups, enabled=not include_hidden)
+
     if not groups:
         return
 
@@ -3290,6 +3648,14 @@ def resolve_model_provider(model_id: str, *, explicitly_picked: bool = False) ->
                     return _finalize(model_id, config_provider, config_base_url)
                 if prefix in _PROVIDER_MODELS and _is_first_party_model(prefix, bare):
                     return _finalize(bare, config_provider, config_base_url)
+                return _finalize(model_id, config_provider, config_base_url)
+            # CommandCode (and its Anthropic sibling) is a multi-vendor proxy,
+            # NOT a first-party provider pointed at a relay: its endpoint serves
+            # namespaced wire ids (deepseek/deepseek-v4.1-flash, Qwen/…,
+            # moonshotai/…) and rejects the stripped bare form ("Model … is not
+            # supported on this endpoint"). Never strip a known-provider prefix
+            # for it — preserve the id the user picked.
+            if _canonicalise_provider_id(config_provider) in {"commandcode", "commandcode-anthropic"}:
                 return _finalize(model_id, config_provider, config_base_url)
             # Non-custom first-party provider pointed at an OpenAI-compatible
             # proxy (e.g. provider=openai + base_url=litellm): the bare id is
@@ -5279,8 +5645,18 @@ _GPT_5_6_REASONING_MODELS = frozenset({
 
 
 def _is_gpt_5_6_reasoning_model(bare_model: str) -> bool:
-    """Return whether an OpenAI-family model uses GPT-5.6's max ladder."""
-    return str(bare_model or "").strip().lower() in _GPT_5_6_REASONING_MODELS
+    """Return whether an OpenAI-family model uses GPT-5.6's max ladder.
+
+    Codex exposes the verified large-context GPT-5.6 models as picker-only
+    ``-900k`` aliases. The suffix changes the context-window selection, not the
+    model's reasoning ladder, so compare the underlying verified slug while
+    keeping the exact allowlist (rather than treating every ``*-900k`` alias as
+    a GPT-5.6 model).
+    """
+    model = str(bare_model or "").strip().lower()
+    if model.endswith("-900k"):
+        model = model[:-len("-900k")]
+    return model in _GPT_5_6_REASONING_MODELS
 
 
 def _filter_reasoning_efforts_for_provider(
@@ -5339,7 +5715,135 @@ _KNOWN_REASONING_PROVIDERS = frozenset({
     "gemini", "google", "google-gemini",
     "deepseek", "x-ai", "xai", "grok",
     "copilot", "github-copilot", "openrouter",
+    "commandcode", "commandcode-chat", "commandcode-anthropic", "commandcode-claude",
 })
+
+
+# ── CommandCode reasoning levels (CLI-bundle mirror) ─────────────────────────
+# Mirrors ``agent.reasoning_effort.COMMANDCODE_REASONING_EFFORTS`` in hermes-agent
+# (extracted from the official ``command-code`` CLI bundle
+# ``command-code@1.60.0`` ``dist/cli.mjs`` effort map ``kr`` — the same catalog
+# pi's ``pi-commandcode-provider`` syncs daily) so the WebUI can serve per-model
+# levels without importing the agent tree (standalone Docker rule, api/config.py
+# header comment). The Provider API publishes no reasoning metadata
+# (``GET /provider/v1/models`` carries only id/context/endpoints).
+#
+# Live-verified 2026-09-21 (authenticated, ``hermes-cli`` UA): the endpoint's
+# generic enum is ``low|medium|high|xhigh|max`` — a ``__probe__`` level 400s
+# with exactly that set on every family probed, and ``minimal`` on
+# ``meta/muse-spark-1.3`` 400s. Entries below the ``kr`` separator are live on
+# ``/models`` but absent from the CLI map, so they carry that endpoint-verified
+# enum until the CLI publishes their levels. When the CLI version bumps,
+# re-extract (``kr=new Map([[`` in ``dist/cli.mjs``) and update both copies;
+# ``scripts/`` has no fetcher — extraction is a documented manual run.
+_COMMANDCODE_CLI_VERSION = "1.60.0"
+_COMMANDCODE_ENUM_FALLBACK = ("low", "medium", "high", "xhigh", "max")
+_COMMANDCODE_REASONING_EFFORTS = {
+    # ── CLI map (kr), verbatim ──
+    "claude-sonnet-5": ("low", "medium", "high", "xhigh", "max"),
+    "claude-sonnet-4-6": ("low", "medium", "high", "xhigh", "max"),
+    "claude-fable-5-1": ("low", "medium", "high", "xhigh", "max"),
+    "claude-fable-5": ("low", "medium", "high", "xhigh", "max"),
+    "claude-opus-5": ("low", "medium", "high", "xhigh", "max"),
+    "claude-opus-4-8": ("low", "medium", "high", "xhigh", "max"),
+    "claude-opus-4-7": ("low", "medium", "high", "xhigh", "max"),
+    "gpt-6-astra": ("low", "medium", "high", "xhigh", "max"),
+    "gpt-5.6-sol": ("low", "medium", "high", "xhigh", "max"),
+    "gpt-5.6-terra": ("low", "medium", "high", "xhigh", "max"),
+    "gpt-5.6-luna": ("low", "medium", "high", "xhigh", "max"),
+    "gpt-5.5": ("low", "medium", "high", "xhigh"),
+    "gpt-5.4": ("low", "medium", "high", "xhigh"),
+    "gpt-5.3-codex": ("low", "medium", "high", "xhigh"),
+    "gpt-5.4-mini": ("low", "medium", "high"),
+    "deepseek/deepseek-v4-pro": ("high", "max"),
+    "deepseek/deepseek-v4-flash": ("high", "max"),
+    "deepseek/deepseek-v4-flash-vision-exp": ("high", "max"),
+    "deepseek/deepseek-v4-flash-fast": ("low", "high", "max"),
+    "deepseek/deepseek-v4.1-flash": ("low", "high", "max"),
+    "meta/muse-spark-1.1": ("low", "medium", "high", "xhigh"),
+    "meta/muse-spark-1.2": ("low", "medium", "high", "xhigh"),
+    "meta/muse-spark-1.2-contributor": ("low", "medium", "high", "xhigh"),
+    "meta/muse-spark-1.3": ("low", "medium", "high", "xhigh", "max"),
+    # Endpoint-won deviation (live probe 2026-09-21): contributor serves max
+    # too (200, 1114 reasoning tokens vs 720 at xhigh) despite the CLI map cap.
+    "meta/muse-spark-1.3-contributor": ("low", "medium", "high", "xhigh", "max"),
+    "stepfun/step-5-preview": ("low", "medium", "high"),
+    "minimaxai/minimax-m3": ("low", "medium", "high"),
+    "minimax/minimax-m3-free": ("low", "medium", "high"),
+    "google/gemini-3.1-flash-lite": ("low", "medium", "high"),
+    "google/gemini-3.5-flash": ("low", "medium", "high"),
+    "google/gemini-3.5-flash-lite": ("low", "medium", "high"),
+    "google/gemini-3.6-flash": ("low", "medium", "high"),
+    "google/gemini-3.7-flash": ("low", "medium", "high"),
+    "google/gemini-3.8-flash": ("low", "medium", "high"),
+    "qwen/qwen3.8-omni-flash": ("low", "medium", "xhigh"),
+    "qwen/qwen3.8-max-0902": ("low", "medium", "xhigh"),
+    "qwen/qwen3.8-max": ("low", "medium", "xhigh"),
+    "qwen/qwen3.8-27b": ("low", "medium", "xhigh"),
+    "qwen/qwen3.8-flash": ("low", "medium", "xhigh"),
+    "moonshotai/kimi-k3": ("low", "high", "max"),
+    "sakana/fugu-ultra": ("high", "xhigh"),
+    "xai/grok-4.5": ("low", "medium", "high"),
+    "xai/grok-4.6": ("low", "medium", "high", "xhigh"),
+    "xai/grok-4.7": ("low", "medium", "high", "xhigh"),
+    "tencent/hy4-preview": ("low", "medium", "high"),
+    "zai-org/glm-5.2": ("high", "max"),
+    "zai-org/glm-5.3": ("low", "high", "max"),
+    "z-ai/glm-5.3-flash": ("low", "high", "max"),
+    "z-ai/glm-5.3-flashx": ("low", "high", "max"),
+    # ── Live on /models but absent from the CLI map: endpoint enum ──
+    "claude-haiku-4-5-20251001": _COMMANDCODE_ENUM_FALLBACK,
+    "qwen/qwen3.6-max-preview": _COMMANDCODE_ENUM_FALLBACK,
+    "qwen/qwen3.6-plus": _COMMANDCODE_ENUM_FALLBACK,
+    "qwen/qwen3.7-flash": _COMMANDCODE_ENUM_FALLBACK,
+    "qwen/qwen3.7-max": _COMMANDCODE_ENUM_FALLBACK,
+    "qwen/qwen3.7-plus": _COMMANDCODE_ENUM_FALLBACK,
+    "moonshotai/kimi-k2.5": _COMMANDCODE_ENUM_FALLBACK,
+    "moonshotai/kimi-k2.6": _COMMANDCODE_ENUM_FALLBACK,
+    "moonshotai/kimi-k2.7-code": _COMMANDCODE_ENUM_FALLBACK,
+    "moonshotai/kimi-k2.7-code-highspeed": _COMMANDCODE_ENUM_FALLBACK,
+    "zai-org/glm-5": _COMMANDCODE_ENUM_FALLBACK,
+    "zai-org/glm-5.1": _COMMANDCODE_ENUM_FALLBACK,
+    "zai-org/glm-5.2-fast": _COMMANDCODE_ENUM_FALLBACK,
+    "minimaxai/minimax-m2.5": _COMMANDCODE_ENUM_FALLBACK,
+    "minimaxai/minimax-m2.7": _COMMANDCODE_ENUM_FALLBACK,
+    "minimax/minimax-m2.7-free": _COMMANDCODE_ENUM_FALLBACK,
+    "xiaomi/mimo-v2.5": _COMMANDCODE_ENUM_FALLBACK,
+    "xiaomi/mimo-v2.5-pro": _COMMANDCODE_ENUM_FALLBACK,
+    "xiaomi/mimo-v2.6-flash": _COMMANDCODE_ENUM_FALLBACK,
+    "xiaomi/mimo-v2.6-pro": _COMMANDCODE_ENUM_FALLBACK,
+    "xiaomi/mimo-v2.6-pro-ultraspeed": _COMMANDCODE_ENUM_FALLBACK,
+    "stepfun/step-3.5-flash": _COMMANDCODE_ENUM_FALLBACK,
+    "stepfun/step-3.7-flash": _COMMANDCODE_ENUM_FALLBACK,
+    "tencent/hy3-paid": _COMMANDCODE_ENUM_FALLBACK,
+    "meituan/longcat-2.0": _COMMANDCODE_ENUM_FALLBACK,
+    "poolside/laguna-s-2.1-free": _COMMANDCODE_ENUM_FALLBACK,
+    "inclusionai/ling-3.0-flash-sante:free": _COMMANDCODE_ENUM_FALLBACK,
+    "thinkingmachines/inkling": _COMMANDCODE_ENUM_FALLBACK,
+    "thinkingmachines/inkling-small": _COMMANDCODE_ENUM_FALLBACK,
+    "nvidia/nemotron-3-ultra-550b-a55b": _COMMANDCODE_ENUM_FALLBACK,
+}
+
+
+def _commandcode_reasoning_efforts(model_id: str) -> list[str] | None:
+    """Return CLI-published reasoning levels for a CommandCode model id.
+
+    ``None`` means unknown — not on the CLI map and not live-verified — so the
+    caller falls through to the existing metadata/heuristic chain (never invent
+    levels for it). Case-insensitive, with a bare-slug fallback so
+    ``muse-spark-1.3`` resolves like ``meta/muse-spark-1.3``.
+    """
+    m = str(model_id or "").strip().lower()
+    if not m:
+        return None
+    hit = _COMMANDCODE_REASONING_EFFORTS.get(m)
+    if hit is not None:
+        return list(hit)
+    bare = m.rsplit("/", 1)[-1]
+    for key, levels in _COMMANDCODE_REASONING_EFFORTS.items():
+        if key.rsplit("/", 1)[-1] == bare:
+            return list(levels)
+    return None
 
 
 def _provider_known_reasoning_capable(provider_id) -> bool:
@@ -5811,6 +6315,16 @@ def _resolve_model_reasoning_efforts_impl(
         if set(normalized).issubset({"off", "on"}):
             return []
         return []
+
+    # CommandCode: CLI-published levels are authoritative (Provider API carries
+    # no reasoning metadata). Checked before models.dev, which over-advertises
+    # (e.g. claims ``minimal`` for Muse 1.3 — the endpoint 400s it).
+    if provider in {"commandcode", "commandcode-chat"}:
+        cli_efforts = _commandcode_reasoning_efforts(hinted_model)
+        if cli_efforts is not None:
+            return _filter_reasoning_efforts_for_provider(
+                cli_efforts, hinted_model, provider
+            )
 
     # _models_dev_reasoning_efforts already applies the provider/model filter
     # internally, so it is returned as-is here (filtering again would be
@@ -6416,6 +6930,25 @@ def set_hermes_default_model(model_id: str, provider: str | None = None, advance
         # so the agent's auxiliary client uses the ``no-key-required`` path.
         if persisted_provider.lower() == "local":
             persisted_provider = "custom"
+        # Multi-vendor relays (commandcode) serve namespaced wire ids such as
+        # ``deepseek/deepseek-v4.1-flash``. A Settings save can arrive
+        # provider-decorated (``commandcode/deepseek/...``) because the picker
+        # round-trips whatever shape it was shown, and resolve_model_provider()
+        # above only peels ONE decoration layer. Persist the wire form: config
+        # consumers OUTSIDE the WebUI resolver (gateway/discord turns, vision
+        # auto-detect, new-session inheritance) copy model.default verbatim,
+        # and the commandcode endpoint rejects decorated ids with
+        # "Model ... is not supported on this endpoint". Loop the strip so a
+        # repeated save can never stack layers.
+        if (
+            persisted_model
+            and persisted_provider
+            and _canonicalise_provider_id(persisted_provider)
+            in {"commandcode", "commandcode-anthropic"}
+        ):
+            _decorated_prefix = f"{persisted_provider.strip().lower()}/"
+            while persisted_model.lower().startswith(_decorated_prefix):
+                persisted_model = persisted_model[len(_decorated_prefix):].strip()
 
         model_cfg["default"] = persisted_model
         if persisted_provider:
@@ -7361,6 +7894,7 @@ def _static_models_catalog_without_live_probes() -> dict:
                     )
 
         _deduplicate_model_ids(groups)
+        _apply_user_model_exclusions(groups)
         groups = [
             group
             for group in groups
@@ -8613,7 +9147,7 @@ def _read_visible_codex_cache_model_ids() -> list[str]:
     return ordered
 
 
-def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = False) -> dict:
+def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = False, include_hidden: bool = False) -> dict:
     """
     Return available models grouped by provider.
 
@@ -9564,6 +10098,22 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
                         )
                 if apply_prefix:
                     picker_models = _apply_provider_prefix(picker_models, provider_id, active_provider)
+                # Per-provider user exclusion (#7507): subtract BEFORE the
+                # visible/overflow split so eligible later rows backfill the
+                # visible quota instead of leaving gaps.
+                try:
+                    _hidden_here = set() if include_hidden else _model_excluded_ids_for_provider(provider_id)
+                except Exception:
+                    _hidden_here = set()
+                if _hidden_here:
+                    picker_models = [
+                        _m for _m in picker_models
+                        if not (
+                            isinstance(_m, dict)
+                            and str(_m.get("id") or "").strip()
+                            and _model_exclusion_key(str(_m.get("id"))) & _hidden_here
+                        )
+                    ]
                 visible_models, extra_models = _split_picker_overflow_models(
                     picker_models,
                     selected_model_id=_picker_selected_model_id,
@@ -9907,16 +10457,12 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
                     provider_cfg = _get_provider_cfg(_raw_key)
                     raw_models = []
 
-                    # User-configured model allowlists are explicit local
-                    # source-of-truth for custom/plugin providers, AND for most
-                    # built-in Hermes providers (e.g. providers.anthropic.models
-                    # is a real picker allowlist — see #644). Copilot is the
-                    # exception: it uses providers.copilot.models as a per-model
-                    # settings map (reasoning_effort, limits, etc.), so treating
-                    # that as an allowlist collapsed the Copilot picker to
-                    # whichever model had local settings. Only Copilot skips the
-                    # config-models allowlist branch and asks Hermes CLI for the
-                    # live catalog first (static _PROVIDER_MODELS is fallback only).
+                    # User-configured model lists remain an explicit opt-out for
+                    # providers that deliberately pin their catalog. Discovered
+                    # metadata mappings are different: they do not suppress the
+                    # live probe. The Vercel entries in the active config have no
+                    # chat `models:` field, so they take the live endpoint path
+                    # below and the WebUI negative list performs the subtraction.
                     _uses_models_as_settings_map = (
                         pid == "copilot"
                         or _provider_models_are_discovered_catalog(provider_cfg)
@@ -9928,6 +10474,16 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
                     ):
                         raw_models = _configured_model_options(provider_cfg.get("models"))
 
+                    provider_models_endpoint_error = None
+
+                    # A route-bearing providers.<id> entry is a named endpoint even
+                    # when Hermes has no static provider registry row for that id
+                    # (for example, two Vercel Gateway credentials). If it has
+                    # no explicit models list, use that endpoint's live /models
+                    # catalog. The old path only called provider_model_ids(pid),
+                    # which knows built-ins but not arbitrary configured slugs;
+                    # removing the generated allowlist therefore made the group
+                    # disappear instead of becoming live-discovered.
                     if not raw_models:
                         if pid == "moa":
                             raw_models = _moa_preset_models_from_config(cfg)
@@ -9944,6 +10500,44 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
                                 pid,
                                 _read_live_provider_model_ids(pid),
                             )
+                            if not raw_models and isinstance(provider_cfg, dict):
+                                _endpoint = str(
+                                    provider_cfg.get("api")
+                                    or provider_cfg.get("base_url")
+                                    or provider_cfg.get("url")
+                                    or ""
+                                ).strip()
+                                if _endpoint and _provider_discover_allowed(provider_cfg):
+                                    _endpoint_key = str(provider_cfg.get("api_key") or "").strip()
+                                    if _endpoint_key.startswith("${") and _endpoint_key.endswith("}"):
+                                        _endpoint_key = _thread_local_env_value(
+                                            _endpoint_key[2:-1].strip()
+                                        ).strip()
+                                    if not _endpoint_key:
+                                        _key_env = str(
+                                            provider_cfg.get("key_env")
+                                            or provider_cfg.get("api_key_env")
+                                            or ""
+                                        ).strip()
+                                        if _key_env:
+                                            _endpoint_key = _thread_local_env_value(_key_env).strip()
+                                    try:
+                                        raw_models, provider_models_endpoint_error = (
+                                            _read_custom_endpoint_models(
+                                                _endpoint,
+                                                pid,
+                                                api_key=_endpoint_key,
+                                                trusted_base_urls=(_endpoint,),
+                                            )
+                                        )
+                                    except Exception:
+                                        logger.debug(
+                                            "Named provider live catalog failed for %s",
+                                            pid,
+                                            exc_info=True,
+                                        )
+                                        raw_models = []
+
                             if (
                                 not raw_models
                                 and _provider_models_are_discovered_catalog(provider_cfg)
@@ -9964,7 +10558,12 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
                     detected_models = auto_detected_models_by_provider.get(pid, [])
                     if detected_models and not raw_models:
                         raw_models = copy.deepcopy(detected_models)
-                    _append_picker_group(provider_name, pid, raw_models)
+                    _append_picker_group(
+                        provider_name,
+                        pid,
+                        raw_models,
+                        models_endpoint_error=provider_models_endpoint_error,
+                    )
                 else:
                     detected_models = auto_detected_models_by_provider.get(pid)
                     if detected_models:
@@ -10083,7 +10682,8 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
         # Post-process: ensure model IDs are globally unique across groups.
         # When multiple providers expose the same bare model ID, prefix
         # collisions with @provider_id: so the frontend can distinguish them.
-        _deduplicate_model_ids(groups)
+        _deduplicate_model_ids(groups, include_hidden=include_hidden)
+        _apply_user_model_exclusions(groups, enabled=not include_hidden)
 
         # Defense-in-depth: drop any optgroup that ended up with zero models
         # — those are pure UI noise. A zero-model group typically means a
@@ -10146,6 +10746,10 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
             "groups": groups,
             "aliases": model_aliases,
         }
+
+    # Manager builds a private unfiltered snapshot; never publishes it to picker caches.
+    if include_hidden:
+        return _build_available_models_uncached()
 
     # ── FAST PATH ─────────────────────────────────────────────────────────────
     # Mark that a build may be in progress BEFORE acquiring the lock.
@@ -11612,6 +12216,10 @@ _SETTINGS_DEFAULTS = {
     "workspace_todos_tab": False,  # show a Todos tab in the workspace panel (right side)
     "api_redact_enabled": True,  # redact sensitive data (API keys, secrets) from API responses
     "dashboard_plugins": {},  # plugin_name -> bool, opt-in per plugin (default off per PF-10b)
+    "models_hidden": {},  # canonical provider id -> [model ids] hidden from the picker (#7507); untracked-safe: no secrets
+    "models_global_hidden": [],
+    "models_provider_overrides": {},
+    "models_meta": {},  # gateway metadata cache: bare model id -> {type, released, created, ...} (patch 04)
     "sidebar_density": "compact",  # compact | detailed
     "auto_title_refresh_every": "0",  # adaptive title refresh: 0=off, 5/10/20=every N exchanges
     "default_message_mode": "steer",  # behavior when sending while agent is running: queue | interrupt | steer
@@ -12075,10 +12683,33 @@ def save_settings(settings: dict) -> dict:
             # polluted with non-bool/non-str junk from a crafted POST.
             current_dash.update({k: bool(v) for k, v in _dashboard_plugins.items() if isinstance(k, str)})
             current["dashboard_plugins"] = current_dash
+    # Replace models_hidden dict (provider id -> [model ids]) wholesale: it is
+    # a user-curated exclusion list, not a merge target (#7507).
+    if isinstance(settings.get("models_hidden"), dict):
+        current["models_hidden"] = {
+            str(k): [str(m) for m in v if str(m or "").strip()]
+            for k, v in settings["models_hidden"].items()
+            if isinstance(k, str) and isinstance(v, list)
+        }
+    # Replace models_meta cache wholesale: the manager writes the full gateway
+    # feed snapshot; the reader only consumes it (patch 04).
+    if isinstance(settings.get("models_meta"), dict):
+        current["models_meta"] = {
+            str(k).strip().lower(): v
+            for k, v in settings["models_meta"].items()
+            if isinstance(k, str) and str(k).strip() and isinstance(v, dict)
+        }
+    if "models_global_hidden" in settings:
+        current["models_global_hidden"] = _normalise_models_global_hidden(settings["models_global_hidden"])
+    if "models_provider_overrides" in settings:
+        current["models_provider_overrides"] = _normalise_models_provider_overrides(settings["models_provider_overrides"])
     for k, v in settings.items():
+        if k in {"models_global_hidden", "models_provider_overrides"}:
+            continue
         key_is_speech = k in _SETTINGS_SPEECH_KEYS
         # dashboard_plugins is deep-merged above (not a flat allowlisted scalar).
-        if k == "dashboard_plugins":
+        # models_hidden / models_meta are replaced wholesale above for the same reason.
+        if k == "dashboard_plugins" or k == "models_hidden" or k == "models_meta":
             continue
         if k in _SETTINGS_ALLOWED_KEYS:
             if k == "theme":

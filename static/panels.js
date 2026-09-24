@@ -1241,6 +1241,7 @@ function _renderCronDetail(job){
   const isNoAgent = _isCronScriptJob(job);
   const isReadOnly = !!job.read_only;
   const cronJobMode = _cronModeLabel(job);
+  const reasoningEffort = String(job.reasoning_effort || '').trim();
   const modelProvider =
     job.provider && job.model ? `${esc(job.provider)}/${esc(job.model)}` :
     job.model ? esc(job.model) :
@@ -1289,7 +1290,7 @@ function _renderCronDetail(job){
         <div class="detail-row"><div class="detail-row-label">${esc(t('cron_next'))}</div><div class="detail-row-value">${esc(nextRun)}</div></div>
         <div class="detail-row"><div class="detail-row-label">${esc(t('cron_last'))}</div><div class="detail-row-value">${esc(lastRun)}</div></div>
         <div class="detail-row"><div class="detail-row-label">Deliver</div><div class="detail-row-value">${esc(deliver)}</div></div>
-        <div class="detail-row"><div class="detail-row-label">${esc(t('cron_mode_label') || 'Mode')}</div><div class="detail-row-value"><span class="detail-badge cron-mode-badge ${isNoAgent ? 'script' : 'agent'}" id="cronJobMode">${esc(cronJobMode)}</span>${modelProvider ? ` <code>${modelProvider}</code>` : ''}</div></div>
+        <div class="detail-row"><div class="detail-row-label">${esc(t('cron_mode_label') || 'Mode')}</div><div class="detail-row-value"><span class="detail-badge cron-mode-badge ${isNoAgent ? 'script' : 'agent'}" id="cronJobMode">${esc(cronJobMode)}</span>${modelProvider ? ` <code>${modelProvider}</code>` : ''}${reasoningEffort ? ` <code>${esc(reasoningEffort)}</code>` : ''}</div></div>
         ${showOwnerRow ? `<div class="detail-row"><div class="detail-row-label">Owner profile</div><div class="detail-row-value"><span class="detail-badge active" title="${esc(ownerProfileTitle)}">${esc(ownerProfileLabel)}</span></div></div>` : ''}
         <div class="detail-row"><div class="detail-row-label">${esc(t('cron_profile_label') || 'Profile')}</div><div class="detail-row-value"><span class="detail-badge active" title="${esc(profileTitle)}">${esc(profileLabel)}</span></div></div>
         <div class="detail-row"><div class="detail-row-label">${esc(t('cron_toast_notifications_label') || 'Completion toasts')}</div><div class="detail-row-value"><span class="detail-badge ${toastNotifications ? 'active' : ''}">${esc(toastNotifications ? (t('cron_toast_notifications_enabled') || 'Enabled') : (t('cron_toast_notifications_disabled') || 'Disabled'))}</span></div></div>
@@ -1578,6 +1579,7 @@ function duplicateCurrentCron(){
     script: job.script || '',
     model: job.model || '',
     provider: job.provider || '',
+    reasoning_effort: job.reasoning_effort || '',
     isEdit: false,
   });
   if (!_cronSkillsCache) {
@@ -1641,6 +1643,7 @@ function openCronEdit(job){
     script: job.script || '',
     model: job.model || '',
     provider: job.provider || '',
+    reasoning_effort: job.reasoning_effort || '',
     isEdit: true,
   });
   if (!_cronSkillsCache) {
@@ -1651,7 +1654,7 @@ function openCronEdit(job){
   loadCronProfiles().then(()=>_refreshCronProfileSelect(job.profile || '')).catch(()=>{});
 }
 
-function _renderCronForm({ name, schedule, prompt, deliver, profile, toast_notifications=true, no_agent=false, script='', model='', provider='', isEdit }){
+function _renderCronForm({ name, schedule, prompt, deliver, profile, toast_notifications=true, no_agent=false, script='', model='', provider='', reasoning_effort='', isEdit }){
   const title = $('taskDetailTitle');
   const body = $('taskDetailBody');
   const empty = $('taskDetailEmpty');
@@ -1754,6 +1757,13 @@ function _renderCronForm({ name, schedule, prompt, deliver, profile, toast_notif
           <div class="detail-form-hint">${esc(isNoAgent ? (t('cron_model_no_agent_hint') || 'No-agent jobs run the configured script directly; model is unused.') : (t('cron_model_hint') || 'Use the profile default model at run time, or pin this job to a specific provider/model.'))}</div>
         </div>
         <div class="detail-form-row">
+          <label for="cronFormReasoning">${esc(t('cron_reasoning_label') || 'Reasoning Effort')}</label>
+          <select id="cronFormReasoning"${isNoAgent ? ' disabled' : ''}>
+            ${_cronReasoningEffortOptions(reasoning_effort)}
+          </select>
+          <div class="detail-form-hint">${esc(isNoAgent ? (t('cron_model_no_agent_hint') || 'No-agent jobs run the configured script directly; model is unused.') : (t('cron_reasoning_hint') || 'Pin a reasoning effort level for this job, or leave default to follow the model.'))}</div>
+        </div>
+        <div class="detail-form-row">
           <label for="cronFormToastNotifications">${esc(t('cron_toast_notifications_label') || 'Completion toasts')}</label>
           <label class="detail-form-check" for="cronFormToastNotifications">
             <input type="checkbox" id="cronFormToastNotifications" ${toastNotifications ? 'checked' : ''}>
@@ -1804,6 +1814,17 @@ async function _populateCronDeliverOptions(selectedValue, isEdit) {
     sel.innerHTML = '<option value="local">Local (save output only)</option>';
   }
   sel.disabled = false;
+}
+
+function _cronReasoningEffortOptions(selected){
+  const levels = ['', 'none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'];
+  const cur = String(selected || '').trim().toLowerCase();
+  const opts = levels.slice();
+  if (cur && opts.indexOf(cur) === -1) opts.push(cur);
+  return opts.map(v => {
+    const label = v === '' ? (t('cron_reasoning_use_default') || 'Default (follow model/config)') : v;
+    return `<option value="${v}"${v === cur ? ' selected' : ''}>${esc(label)}</option>`;
+  }).join('');
 }
 
 async function _populateCronFormModelSelect(selectedModel, selectedProvider, disabled){
@@ -2004,6 +2025,8 @@ async function saveCronForm(){
         }
         // else: select not yet populated — omit model/provider to preserve saved value
       }
+      const effortEl = $('cronFormReasoning');
+      if (effortEl && !isNoAgent) updates.reasoning_effort = effortEl.value || null;
       await api('/api/crons/update', {method:'POST', body: JSON.stringify(updates)});
       const editedId = _editingCronId;
       _editingCronId = null;
@@ -2030,6 +2053,8 @@ async function saveCronForm(){
       body.model = _cronModelBareName(_cronPreFormDetail.model, _cronPreFormDetail.provider) || null;
       body.provider = _cronPreFormDetail.provider || null;
     }
+    const effortEl = $('cronFormReasoning');
+    if (effortEl && !isNoAgent && effortEl.value) body.reasoning_effort = effortEl.value;
     const res = await api('/api/crons/create',{method:'POST',body:JSON.stringify(body)});
     _cronPreFormDetail = null;
     _cronIsDuplicate = false;
@@ -11034,8 +11059,13 @@ const _SELF_HOSTED_DEFAULT_BASE_URLS = Object.freeze({
   lmstudio: 'http://localhost:1234/v1',
 });
 
-async function _fetchProviderQuotaStatus(force=false){
-  const endpoint=force?`/api/provider/quota?refresh=1&ts=${Date.now()}`:'/api/provider/quota';
+async function _fetchProviderQuotaStatus(force=false,provider=null){
+  const baseEndpoint='/api/provider/quota';
+  const normalizedProvider=String(provider||'').trim();
+  const providerQuery=normalizedProvider?`?provider=${encodeURIComponent(normalizedProvider)}`:'';
+  const endpoint=force
+    ? `${baseEndpoint}${providerQuery}${providerQuery?'&':'?'}refresh=1&ts=${Date.now()}`
+    : `${baseEndpoint}${providerQuery}`;
   const status=await api(endpoint,{cache:'no-store'});
   if(status&&typeof status==='object') status.client_fetched_at=new Date().toISOString();
   return status;
@@ -11047,14 +11077,33 @@ async function loadProvidersPanel(){
   if(!list) return;
   try{
     const data=await api('/api/providers');
-    const quota=await _fetchProviderQuotaStatus(false).catch(e=>({ok:false,status:'unavailable',quota:null,message:e.message||t('provider_quota_unavailable'),client_fetched_at:new Date().toISOString()}));
+    const activeProvider=String(data.active_provider||'').trim().toLowerCase();
+    const quotaStatuses=[];
+    const quota=await _fetchProviderQuotaStatus(false).catch(e=>({ok:false,status:'unavailable',quota:null,message:e.message||t('provider_quota_unavailable'),client_fetched_at:new Date().toISOString(),provider:activeProvider}));
+    if(quota){
+      quota.is_active_provider=!activeProvider||String(quota.provider||'').trim().toLowerCase()===activeProvider;
+      quotaStatuses.push(quota);
+    }
+    // Codex pool limits are useful even when another provider/model is active.
+    // Fetch it separately so the Settings card does not silently follow only
+    // the current routing provider.
+    const codexConfig=(data.providers||[]).find(p=>String(p&&p.id||'').trim().toLowerCase()==='openai-codex');
+    if(codexConfig&&codexConfig.has_key&&activeProvider!=='openai-codex'){
+      const codexQuota=await _fetchProviderQuotaStatus(false,'openai-codex').catch(e=>({ok:false,status:'unavailable',quota:null,provider:'openai-codex',message:e.message||t('provider_quota_unavailable'),client_fetched_at:new Date().toISOString()}));
+      if(codexQuota){
+        codexQuota.is_active_provider=false;
+        quotaStatuses.push(codexQuota);
+      }
+    }
     const providers=(data.providers||[]).filter(p=>p.configurable||p.is_oauth||p.is_custom||p.is_plugin_provider||p.is_self_hosted);
     list.innerHTML='';
     _providerCardEls.clear();
-    const quotaCard=_buildProviderQuotaCard(quota);
-    if(quotaCard){
-      list.appendChild(quotaCard);
-      renderProviderCostChart(quotaCard); // async, fire-and-forget
+    for(const quotaStatus of quotaStatuses){
+      const quotaCard=_buildProviderQuotaCard(quotaStatus);
+      if(quotaCard){
+        list.appendChild(quotaCard);
+        if(quotaStatus.is_active_provider!==false) renderProviderCostChart(quotaCard); // async, fire-and-forget
+      }
     }
     if(providers.length===0){
       list.style.display='none';
@@ -11081,8 +11130,9 @@ async function _refreshProviderQuota(card,button){
   let failed=false;
   let next;
   try{
-    next=await _fetchProviderQuotaStatus(true);
+    next=await _fetchProviderQuotaStatus(true,card.dataset.provider||null);
     failed=next&&next.ok===false;
+    if(next) next.is_active_provider=card.dataset.activeProvider!=='0';
   }catch(e){
     failed=true;
     next={ok:false,status:'unavailable',quota:null,message:e.message||t('provider_quota_unavailable'),client_fetched_at:new Date().toISOString()};
@@ -11224,6 +11274,10 @@ function _buildProviderQuotaPoolBreakdown(accountLimits){
     const windows=Array.isArray(credential&&credential.windows)?credential.windows:[];
     const details=Array.isArray(credential&&credential.details)?credential.details.filter(Boolean):[];
     const unavailableReason=_providerQuotaUnavailableReason(credential);
+    const bankedResets=Number.isFinite(Number(credential&&credential.banked_resets))?Math.max(0,Math.floor(Number(credential.banked_resets))):0;
+    const resetButton=bankedResets>0
+      ? `<button class="provider-quota-reset" type="button" data-provider-quota-reset data-credential-index="${idx+1}" data-credential-label="${esc(label)}">Redeem 1 reset credit (${bankedResets} available)</button>`
+      : '';
     const windowHtml=windows.length?windows.map(w=>{
       const remaining=_formatProviderQuotaPercent(w&&w.remaining_percent);
       const used=_formatProviderQuotaPercent(w&&w.used_percent);
@@ -11237,7 +11291,7 @@ function _buildProviderQuotaPoolBreakdown(accountLimits){
       <div class="provider-quota-pool-row provider-quota-pool-row-${status}">
         <div class="provider-quota-pool-row-head">
           <span>${esc(label)}${esc(plan)}</span>
-          <strong>${esc(statusText)}</strong>
+          <span class="provider-quota-pool-row-head-actions"><strong>${esc(statusText)}</strong>${resetButton}</span>
         </div>
         <div class="provider-quota-pool-windows">${windowHtml}</div>
         ${detailHtml}
@@ -11254,11 +11308,73 @@ function _buildProviderQuotaPoolBreakdown(accountLimits){
   `;
 }
 
+async function _redeemProviderQuotaReset(card,button){
+  if(!card||!button||button.disabled) return;
+  const index=Number(button.dataset.credentialIndex);
+  if(!Number.isInteger(index)||index<1) return;
+  const label=button.dataset.credentialLabel||`credential ${index}`;
+  const confirmed=await showConfirmDialog({
+    title:'Redeem Codex reset credit?',
+    message:`Redeem a reset credit for ${label}? This changes the selected subscription and cannot be undone.`,
+    confirmLabel:'Redeem reset',
+    danger:true,
+    focusCancel:true,
+  });
+  if(!confirmed) return;
+  const previousText=button.textContent;
+  button.disabled=true;
+  button.textContent='Redeeming…';
+  button.setAttribute('aria-busy','true');
+  let force=false;
+  let result=null;
+  let cancelled=false;
+  try{
+    while(true){
+      result=await api('/api/provider/quota/reset',{method:'POST',body:JSON.stringify({
+        provider:card.dataset.provider||'openai-codex',
+        credential_index:index,
+        credential_label:label,
+        force,
+      })});
+      if(result&&result.status==='not_exhausted'&&!force){
+        const forceConfirmed=await showConfirmDialog({
+          title:'No exhausted limit detected',
+          message:(result.message||'The provider does not currently report an exhausted limit.')+' Redeem the available credit anyway?',
+          confirmLabel:'Redeem anyway',
+          danger:true,
+          focusCancel:true,
+        });
+        if(!forceConfirmed){cancelled=true;break;}
+        force=true;
+        continue;
+      }
+      break;
+    }
+    if(cancelled) return;
+    if(!result||result.ok!==true){
+      if(typeof showToast==='function') showToast(result&&result.message||'The Codex reset was not redeemed.');
+      return;
+    }
+    if(typeof showToast==='function') showToast(result.message||'Codex reset credit redeemed.');
+    await _refreshProviderQuota(card,null);
+  }catch(e){
+    if(typeof showToast==='function') showToast('Codex reset failed: '+(e.message||String(e)));
+  }finally{
+    if(button.isConnected){
+      button.disabled=false;
+      button.textContent=previousText;
+      button.removeAttribute('aria-busy');
+    }
+  }
+}
+
 function _buildProviderQuotaCard(status){
   if(!status) return null;
   const card=document.createElement('div');
   const state=(status.status||'unavailable').replace(/[^a-z0-9_-]/gi,'').toLowerCase()||'unavailable';
   card.className='provider-quota-card provider-quota-card-'+state;
+  card.dataset.provider=String(status.provider||'').trim().toLowerCase();
+  card.dataset.activeProvider=status.is_active_provider===false?'0':'1';
   const accountLimits=status.account_limits||null;
   const providerBase=status.display_name||status.provider||t('provider_quota_active_provider');
   const provider=(accountLimits&&accountLimits.plan)?`${providerBase} · ${accountLimits.plan}`:providerBase;
@@ -11299,7 +11415,7 @@ function _buildProviderQuotaCard(status){
   card.innerHTML=`
     <div class="provider-quota-header">
       <div>
-        <div class="provider-quota-title">${esc(t('provider_quota_title'))}</div>
+        <div class="provider-quota-title">${esc(status.is_active_provider===false?'Codex pool limits':t('provider_quota_title'))}</div>
         <div class="provider-quota-subtitle">${esc(provider)}</div>
         <div class="provider-quota-checked">${esc(_formatProviderQuotaLastChecked(status))}</div>
       </div>
@@ -11312,6 +11428,7 @@ function _buildProviderQuotaCard(status){
   `;
   const refreshBtn=card.querySelector('[data-provider-quota-refresh]');
   if(refreshBtn) refreshBtn.addEventListener('click',()=>_refreshProviderQuota(card,refreshBtn));
+  card.querySelectorAll('[data-provider-quota-reset]').forEach(button=>button.addEventListener('click',()=>_redeemProviderQuotaReset(card,button)));
   const poolDetails=card.querySelector('.provider-quota-pool');
   if(poolDetails){
     poolDetails.addEventListener('toggle',()=>{

@@ -72,6 +72,36 @@ def test_openai_family_gpt56_models_expose_and_preserve_max():
             ) == "max", f"{model} on {provider} must preserve max"
 
 
+def test_openai_codex_gpt56_900k_variants_expose_and_preserve_max():
+    for model in (
+        "gpt-5.6-sol-900k",
+        "gpt-5.6-terra-900k",
+        "gpt-5.6-luna-900k",
+    ):
+        efforts = cfg.resolve_model_reasoning_efforts(
+            model,
+            provider_id="openai-codex",
+        )
+        assert "max" in efforts, f"{model} on openai-codex must expose max"
+        assert cfg.coerce_reasoning_effort_for_model(
+            "max",
+            model,
+            provider_id="openai-codex",
+        ) == "max", f"{model} on openai-codex must preserve max"
+
+    # Provider-qualified picker ids are accepted by the same resolver path.
+    qualified = "@openai-codex:gpt-5.6-luna-900k"
+    assert "max" in cfg.resolve_model_reasoning_efforts(
+        qualified,
+        provider_id="openai-codex",
+    )
+    assert cfg.coerce_reasoning_effort_for_model(
+        "max",
+        qualified,
+        provider_id="openai-codex",
+    ) == "max"
+
+
 def test_unsupported_xhigh_degrades_to_high_not_disabled():
     # o1/o3/o4 on openai-codex cap at low/medium/high. A configured xhigh (or
     # max) must clamp DOWN to the highest supported level (high), not silently
@@ -594,3 +624,99 @@ def test_qwen_prefixed_alias_reasoning_detection():
             f"{model} must remain reasoning-capable (DeepSeek-R1 hybrid, "
             f"Qwen 2.x must not shadow the DeepSeek detector)"
         )
+
+
+def test_commandcode_muse_spark_13_exposes_max_without_minimal():
+    # CLI bundle (command-code@1.60.0 kr map): 1.3 has max; the endpoint 400s
+    # ``minimal`` (live-verified 2026-09-21) and models.dev wrongly claims it.
+    efforts = cfg.resolve_model_reasoning_efforts(
+        "meta/muse-spark-1.3",
+        provider_id="commandcode",
+    )
+    assert efforts == ["low", "medium", "high", "xhigh", "max"]
+    # Contributor serves max too (live probe 2026-09-21: 200, 1114 reasoning
+    # tokens vs 720 at xhigh) despite the CLI map cap and Meta's
+    # standard-tier-only doc.
+    assert cfg.resolve_model_reasoning_efforts(
+        "meta/muse-spark-1.3-contributor",
+        provider_id="commandcode",
+    ) == ["low", "medium", "high", "xhigh", "max"]
+    # NOTE: coerce deliberately preserves below-floor levels verbatim
+    # (test_coerce_preserves_effort_for_unrecognized_model / #3505: never
+    # escalate); the wire is the final authority — ``minimal`` 400s there.
+    assert cfg.coerce_reasoning_effort_for_model(
+        "minimal", "meta/muse-spark-1.3", provider_id="commandcode",
+    ) == "minimal"
+    assert cfg.coerce_reasoning_effort_for_model(
+        "max", "meta/muse-spark-1.3", provider_id="commandcode",
+    ) == "max"
+
+
+def test_commandcode_muse_variants_cap_below_max():
+    # 1.3-contributor deliberately dropped from this list: the relay serves
+    # ``max`` there (live probe 2026-09-21). The unprobed 1.1/1.2 variants
+    # keep the CLI-map cap until a probe says otherwise.
+    for model in (
+        "meta/muse-spark-1.1",
+        "meta/muse-spark-1.2",
+        "meta/muse-spark-1.2-contributor",
+    ):
+        efforts = cfg.resolve_model_reasoning_efforts(
+            model, provider_id="commandcode",
+        )
+        assert efforts == ["low", "medium", "high", "xhigh"], model
+        assert cfg.coerce_reasoning_effort_for_model(
+            "max", model, provider_id="commandcode",
+        ) == "xhigh", model
+
+
+def test_commandcode_deepseek_qwen_kimi_levels():
+    assert cfg.resolve_model_reasoning_efforts(
+        "deepseek/deepseek-v4.1-flash", provider_id="commandcode",
+    ) == ["low", "high", "max"]
+    # Live on /models but absent from the CLI map: endpoint-verified enum.
+    assert cfg.resolve_model_reasoning_efforts(
+        "Qwen/Qwen3.7-Max", provider_id="commandcode",
+    ) == ["low", "medium", "high", "xhigh", "max"]
+    assert cfg.resolve_model_reasoning_efforts(
+        "moonshotai/Kimi-K2.6", provider_id="commandcode",
+    ) == ["low", "medium", "high", "xhigh", "max"]
+
+
+def test_commandcode_status_shows_toggle_for_muse():
+    status = cfg.get_reasoning_status(
+        model_id="meta/muse-spark-1.3", provider_id="commandcode",
+    )
+    assert status["supports_thinking_toggle"] is True
+    assert status["supported_efforts"] == ["low", "medium", "high", "xhigh", "max"]
+
+
+def test_commandcode_table_matches_agent_source_of_truth():
+    # The WebUI deliberately mirrors agent.reasoning_effort.COMMANDCODE_* (it
+    # cannot import the agent tree in standalone Docker). When the agent tree
+    # IS importable, the copies must agree — otherwise the chip offers levels
+    # the wire clamps differently. Skips (rather than fails) when hermes-agent
+    # is not on sys.path.
+    try:
+        from agent.reasoning_effort import (
+            COMMANDCODE_ENUM_FALLBACK as _agent_fallback,
+            COMMANDCODE_REASONING_EFFORTS as _agent_table,
+            commandcode_supported_efforts as _agent_lookup,
+        )
+    except Exception:
+        import pytest
+        pytest.skip("hermes-agent not importable; mirror checked by value tests above")
+    agent_norm = {str(k).strip().lower(): tuple(v) for k, v in _agent_table.items()}
+    webui_norm = {str(k).strip().lower(): tuple(v) for k, v in cfg._COMMANDCODE_REASONING_EFFORTS.items()}
+    assert webui_norm == agent_norm, (
+        "WebUI _COMMANDCODE_REASONING_EFFORTS drifted from "
+        "agent.reasoning_effort.COMMANDCODE_REASONING_EFFORTS: "
+        f"only-in-webui={sorted(set(webui_norm) - set(agent_norm))} "
+        f"only-in-agent={sorted(set(agent_norm) - set(webui_norm))} "
+        f"value-diffs={sorted(k for k in set(webui_norm) & set(agent_norm) if webui_norm[k] != agent_norm[k])}"
+    )
+    assert tuple(cfg._COMMANDCODE_ENUM_FALLBACK) == tuple(_agent_fallback)
+    for model in ("meta/muse-spark-1.3", "Qwen/Qwen3.7-Max", "muse-spark-1.3", "unknown-xyz"):
+        assert cfg._commandcode_reasoning_efforts(model) == (
+            list(_agent_lookup(model)) if _agent_lookup(model) is not None else None
+        ), model

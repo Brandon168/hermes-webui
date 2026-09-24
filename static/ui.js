@@ -4069,7 +4069,7 @@ function _selectedModelOption(){
   return sel.options[sel.selectedIndex]||null;
 }
 
-function _normalizeConfiguredModelKey(modelId){
+function _normalizeConfiguredModelKey(modelId,providerId){
   let s=String(modelId||'').trim().toLowerCase();
   let strippedAtProvider=false;
   // Strip @provider: prefix (e.g., @custom:jingdong:GLM-5 -> jingdong:GLM-5).
@@ -4087,6 +4087,19 @@ function _normalizeConfiguredModelKey(modelId){
     // aren't deduped in the configured section (#3360).
     if(!strippedAtProvider&&s.includes('/')&&s.indexOf(':')!==-1&&s.indexOf(':')<s.indexOf('/')){
       s=s.slice(s.indexOf('/')+1)||s;
+    }
+    // Strip a provider-qualified alias prefix repeating the entry's own
+    // provider (e.g. 'commandcode/deepseek/model' with provider 'commandcode'
+    // -> 'deepseek/model'). The badges map emits such aliases next to the
+    // @-bound form for one configured entry, so the configured section's
+    // semantic-key dedupe must see both spellings as one model. The typeof
+    // guard keeps single-parameter rebuilds of this function working.
+    const _pid=typeof providerId==='string'?providerId.trim().toLowerCase():'';
+    if(_pid){
+      const _bare=_pid.replace(/^custom:/,'');
+      for(const p of new Set([_bare,_pid])){
+        if(p&&s.startsWith(p+'/')){s=s.slice(p.length+1)||s;break;}
+      }
     }
     // Strip only the first slash-segment (provider prefix), preserving any
     // remaining vendor hierarchy. Using split('/').pop() here previously
@@ -4823,13 +4836,18 @@ function renderModelDropdown(){
       .filter(m=>m.badge&&matches(m));
     const configuredBySemanticKey=new Map();
     const _configuredProviderKey=(m)=>String((m&&m.badge&&m.badge.provider)||_providerFromModelValue(m&&m.value)||'').toLowerCase();
-    const _configuredModelKey=(m)=>_normalizeConfiguredModelKey(m&&m.value||'');
-    const _configuredDisplayPriority=(m)=>{
+    const _configuredModelKey=(m)=>_normalizeConfiguredModelKey(m&&m.value||'',_configuredProviderKey(m));
+    function _configuredDisplayPriority(m){
       // Prefer plain IDs over provider-qualified aliases for readability.
+      // A provider-qualified alias repeating the entry's provider (e.g.
+      // 'commandcode/deepseek/model') is least preferred: it duplicates the
+      // @-bound form and its decorated id can round-trip to relay 400s.
       const v=String((m&&m.value)||'');
-      if(v.startsWith('@')) return 0;
-      if(v.includes('/')) return 1;
-      return 2;
+      const provider=String((m&&m.badge&&m.badge.provider)||'').toLowerCase().replace(/^custom:/,'');
+      if(provider&&v.toLowerCase().startsWith(provider+'/')) return 0;
+      if(v.startsWith('@')) return 1;
+      if(v.includes('/')) return 2;
+      return 3;
     };
     for(const candidate of configuredCandidates){
       const semanticKey=`${_configuredProviderKey(candidate)}::${_configuredModelKey(candidate)}`;

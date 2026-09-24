@@ -139,6 +139,29 @@ class TestSessionNewFastPathWithProvider:
                 f"otherwise the #2518 fallback is invisible to the server."
             )
 
+    def test_configured_default_provider_is_recovered_without_catalog(self, monkeypatch):
+        """A fast click must not depend on browser provider hydration (#new-chat-routing)."""
+        from api.routes import _session_model_state_from_request
+
+        monkeypatch.setattr(
+            "api.routes.get_config",
+            lambda: {
+                "model": {
+                    "default": "deepseek/deepseek-v4.1-flash",
+                    "provider": "vercel-brandon-pro",
+                }
+            },
+        )
+        with patch("api.routes.get_available_models") as mock_catalog:
+            model, provider = _session_model_state_from_request(
+                "deepseek/deepseek-v4.1-flash",
+                None,
+            )
+
+        assert mock_catalog.call_count == 0
+        assert model == "deepseek/deepseek-v4.1-flash"
+        assert provider == "vercel-brandon-pro"
+
 
 # ---------------------------------------------------------------------------
 # Negative: when no provider is available anywhere, slow path is still correct.
