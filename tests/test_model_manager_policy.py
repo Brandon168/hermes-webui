@@ -1,4 +1,5 @@
 import copy
+import time
 import pytest
 from api import config as c
 from api import model_manager as mm
@@ -13,7 +14,7 @@ def env(tmp_path, monkeypatch):
         assert kwargs == {'include_hidden':True}
         return {'groups':copy.deepcopy(groups)}
     monkeypatch.setattr(c,'get_available_models',inventory)
-    c.save_settings({'models_hidden':{'absent':['old/id'],'one':['vendor/model-fast']},'models_meta':{'vendor/image':{'type':'image'},'vendor/model':{'type':'language','released':123}}})
+    c.save_settings({'models_hidden':{'absent':['old/id'],'one':['vendor/model-fast']},'models_meta':{'vendor/image':{'type':'image'},'vendor/model':{'type':'language','released':123}},'models_meta_refreshed_at':int(time.time()),'models_meta_refresh_attempted_at':int(time.time())})
     return groups
 
 def test_global_override_new_provider_and_preservation(env):
@@ -44,7 +45,7 @@ def test_nonchat_and_legacy_hidden_inventory(env):
     assert absent['models'][0]['available'] is False
 
 def test_refresh_failure_and_invalid_actions(env,monkeypatch):
-    monkeypatch.setattr(c,'refresh_gateway_models_meta',lambda:(_ for _ in ()).throw(OSError('offline')))
+    monkeypatch.setattr(c,'refresh_models_meta',lambda:(_ for _ in ()).throw(OSError('offline')))
     assert mm.catalog(refresh=True)['meta_fresh'] is False
     before=c._read_raw_settings_file()
     with pytest.raises(ValueError):mm.mutate({'model_id':'missing','hidden':True})
@@ -68,7 +69,7 @@ def test_commandcode_bare_ids_join_namespaced_meta_and_nest(tmp_path, monkeypatc
     c.save_settings({'models_meta': {
         'openai/gpt-6-luna': {'type': 'language', 'released': 1790035200},
         'anthropic/claude-opus-5': {'type': 'language', 'released': 1790035200},
-    }})
+    }, 'models_meta_refreshed_at': int(time.time()), 'models_meta_refresh_attempted_at': int(time.time())})
     # Meta join: bare commandcode rows resolve through the vendor alias.
     _meta = c._load_gateway_models_meta()
     _luna = c._manager_meta_for('gpt-6-luna', _meta, 'commandcode')

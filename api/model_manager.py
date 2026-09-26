@@ -49,11 +49,11 @@ def _override_state(overrides, key, provider_id):
     return None
 
 
-def _snapshot(refresh=False):
-    fresh = not refresh
-    if refresh:
+def _snapshot(refresh=False, auto_refresh=False):
+    fresh, due = c.models_meta_refresh_state()
+    if refresh or (auto_refresh and due):
         try:
-            c.refresh_gateway_models_meta()
+            c.refresh_models_meta()
             fresh = True
         except Exception:
             fresh = False
@@ -143,7 +143,7 @@ def _response(groups, stored, meta, fresh):
 
 def catalog(refresh=False):
     with _lock:
-        groups, stored, meta, fresh = _snapshot(refresh)
+        groups, stored, meta, fresh = _snapshot(refresh, auto_refresh=True)
         hidden = _materialize(groups, stored, meta)
         if hidden != stored.get('models_hidden', {}):
             c.save_settings({'models_hidden': hidden})

@@ -2603,9 +2603,27 @@ def _apply_user_model_exclusions(groups: list, *, enabled: bool = True) -> int:
 # lower-cased bare id (``creator/model``), so it applies to a model
 # regardless of which provider group carries it. Exact-id join only: variant
 # suffixes (-fast, -pro, -mini, dates) are distinct rows and never inherit.
+#
+# Dates are sourced in a cascade: the gateway ``released`` field first, then
+# models.dev ``release_date`` and OpenRouter ``created`` for rows the feed
+# cannot date (CommandCode wire ids, cross-gateway stealth models). The
+# feed's own ``created`` field is never used — it is one shared batch value
+# for every row. Refreshes run automatically from the manager read path when
+# the snapshot is older than ``_MANAGER_META_TTL_SECONDS``; failed attempts
+# back off for ``_MANAGER_META_RETRY_SECONDS``. ``?refresh=1`` forces one.
 
 _GATEWAY_MODELS_URL = "https://ai-gateway.vercel.sh/v1/models"
 _GATEWAY_MODELS_TIMEOUT_S = 15.0
+# Fallback catalogs for rows the gateway feed cannot date; fetched only when
+# at least one inventory row still needs a date (see the enrichment step).
+_MODELSDEV_URL = "https://models.dev/api.json"
+_OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models"
+_FALLBACK_SOURCE_TIMEOUT_S = 25.0
+# Public catalogs behind Cloudflare reject the default urllib User-Agent (403).
+_SOURCE_USER_AGENT = "hermes-webui/1.0 (local model manager)"
+# Auto-refresh policy for the models_meta snapshot (patch 04).
+_MANAGER_META_TTL_SECONDS = 6 * 60 * 60
+_MANAGER_META_RETRY_SECONDS = 30 * 60
 # Non-chat gateway types hidden from the picker when the manager's non-chat
 # rule is active. Kept as a constant (not user config) so the rule is
 # reviewable in one place.
@@ -2624,7 +2642,7 @@ def _manager_bare_id(entry_id: str) -> str:
 
 
 def _manager_release_value(value):
-    """Keep the gateway's released date without inventing one from created."""
+    """Normalize a released value: ints pass through, non-empty strings stay as-is."""
     if value is None or isinstance(value, bool):
         return None
     if isinstance(value, (int, float)):
@@ -2633,8 +2651,8 @@ def _manager_release_value(value):
     return text or None
 
 
-def refresh_gateway_models_meta(*, timeout: float = _GATEWAY_MODELS_TIMEOUT_S) -> dict:
-    """Fetch and persist the public Vercel gateway metadata snapshot."""
+def _fetch_gateway_meta(*, timeout: float = _GATEWAY_MODELS_TIMEOUT_S) -> dict[str, dict]:
+    """Fetch and trim the public Vercel gateway metadata snapshot (no save)."""
     import urllib.request as _urlreq
 
     req = _urlreq.Request(_GATEWAY_MODELS_URL, headers={"Accept": "application/json"})
@@ -2650,13 +2668,16 @@ def refresh_gateway_models_meta(*, timeout: float = _GATEWAY_MODELS_TIMEOUT_S) -
         mid = str(row.get("id") or "").strip().lower()
         if not mid:
             continue
+        released = _manager_release_value(row.get("released"))
         entry: dict = {
             "type": str(row.get("type") or "").strip().lower() or None,
-            # The manager exposes release dates only. ``created`` is deliberately
-            # not copied: it is an availability/record-creation timestamp, not
-            # evidence that a model was released on that date.
-            "released": _manager_release_value(row.get("released")),
+            # ``created`` is deliberately not copied: the public feed serves
+            # one shared batch value, not a per-model creation date. Per-row
+            # fallback dates come from the source cascade below instead.
+            "released": released,
         }
+        if released is not None:
+            entry["released_source"] = "gateway"
         pricing = row.get("pricing")
         entry["pricing"] = copy.deepcopy(pricing) if isinstance(pricing, dict) else None
         tags = row.get("tags")
@@ -2664,9 +2685,286 @@ def refresh_gateway_models_meta(*, timeout: float = _GATEWAY_MODELS_TIMEOUT_S) -
         name = str(row.get("name") or "").strip()
         entry["name"] = name or None
         meta[mid] = entry
-    saved = save_settings({"models_meta": meta})
+    return meta
+
+
+def _source_slug(bare_id: str) -> str:
+    """Lookup slug for fallback sources: vendor prefix and route suffixes stripped."""
+    slug = str(bare_id or "").strip().lower().rsplit("/", 1)[-1]
+    for suffix in (":free", ":batch"):
+        if slug.endswith(suffix):
+            slug = slug[: -len(suffix)]
+    return slug
+
+
+def _iso_date_to_epoch(value) -> int | None:
+    """Convert an ISO ``YYYY-MM-DD`` date to epoch seconds (UTC midnight)."""
+    import calendar as _cal
+
+    text = str(value or "").strip()[:10]
+    if not text:
+        return None
+    try:
+        parsed = time.strptime(text, "%Y-%m-%d")
+    except ValueError:
+        return None
+    return int(_cal.timegm(parsed))
+
+
+# Vendor → canonical provider ids inside the fallback catalogs. Used to prefer
+# the first-party entry when one slug exists under several providers; a
+# missing/incorrect mapping only falls back to the majority-date rule.
+_MD_VENDOR_PROVIDERS = {
+    "xai": "xai", "z-ai": "zai", "zai-org": "zai", "qwen": "alibaba",
+    "minimaxai": "minimax", "moonshotai": "moonshotai", "meta": "meta",
+    "deepseek": "deepseek", "anthropic": "anthropic", "openai": "openai",
+    "google": "google", "xiaomi": "xiaomi", "stepfun": "stepfun",
+}
+_OR_VENDOR_PREFIXES = {
+    "xai": "x-ai", "z-ai": "z-ai", "zai-org": "z-ai", "qwen": "qwen",
+    "minimaxai": "minimax", "moonshotai": "moonshotai", "meta": "meta",
+    "deepseek": "deepseek", "stealth": "stealth",
+}
+
+
+def _fetch_modelsdev_release_dates(*, timeout: float = _FALLBACK_SOURCE_TIMEOUT_S) -> dict[str, list[tuple[str, int]]]:
+    """Return slug → [(provider, release epoch)] from the public models.dev catalog."""
+    import urllib.request as _urlreq
+
+    req = _urlreq.Request(_MODELSDEV_URL, headers={"Accept": "application/json", "User-Agent": _SOURCE_USER_AGENT})
+    with _urlreq.urlopen(req, timeout=timeout) as resp:  # nosec B310
+        payload = json.loads(resp.read().decode("utf-8", errors="replace"))
+    index: dict[str, list[tuple[str, int]]] = {}
+    if not isinstance(payload, dict):
+        return index
+    for provider, catalog in payload.items():
+        models = catalog.get("models") if isinstance(catalog, dict) else None
+        if not isinstance(models, dict):
+            continue
+        for model_id, model in models.items():
+            if not isinstance(model, dict):
+                continue
+            epoch = _iso_date_to_epoch(model.get("release_date") or model.get("last_updated"))
+            if epoch is None:
+                continue
+            slug = str(model_id or "").strip().lower().rsplit("/", 1)[-1]
+            if slug:
+                index.setdefault(slug, []).append((str(provider), epoch))
+    return index
+
+
+def _fetch_openrouter_created_dates(*, timeout: float = _FALLBACK_SOURCE_TIMEOUT_S) -> dict[str, list[tuple[str, int]]]:
+    """Return slug → [(catalog id, created epoch)] from the public OpenRouter catalog."""
+    import urllib.request as _urlreq
+
+    req = _urlreq.Request(_OPENROUTER_MODELS_URL, headers={"Accept": "application/json", "User-Agent": _SOURCE_USER_AGENT})
+    with _urlreq.urlopen(req, timeout=timeout) as resp:  # nosec B310
+        payload = json.loads(resp.read().decode("utf-8", errors="replace"))
+    rows = payload.get("data") if isinstance(payload, dict) else None
+    index: dict[str, list[tuple[str, int]]] = {}
+    for row in rows if isinstance(rows, list) else []:
+        if not isinstance(row, dict):
+            continue
+        mid = str(row.get("id") or "").strip().lower()
+        created = row.get("created")
+        if not mid or isinstance(created, bool) or not isinstance(created, (int, float)) or created <= 0:
+            continue
+        index.setdefault(_source_slug(mid), []).append((mid, int(created)))
+    return index
+
+
+def _pick_modelsdev_date(hits: list[tuple[str, int]], preferred: str | None) -> int | None:
+    """First-party provider when available, else the most common date (tie: earliest)."""
+    if not hits:
+        return None
+    if preferred:
+        for provider, epoch in hits:
+            if provider == preferred:
+                return epoch
+    counts: dict[int, int] = {}
+    for _, epoch in hits:
+        counts[epoch] = counts.get(epoch, 0) + 1
+    best = max(counts.values())
+    return min(epoch for epoch, count in counts.items() if count == best)
+
+
+def _pick_openrouter_date(bare_id: str, hits: list[tuple[str, int]], preferred: str | None) -> int | None:
+    """Exact catalog id first, then the vendor prefix, else the earliest record."""
+    if not hits:
+        return None
+    lowered = str(bare_id or "").strip().lower()
+    for catalog_id, epoch in hits:
+        if catalog_id == lowered:
+            return epoch
+    if preferred:
+        for catalog_id, epoch in hits:
+            if catalog_id.split("/", 1)[0] == preferred:
+                return epoch
+    return min(epoch for _, epoch in hits)
+
+
+def _resolve_fallback_released(
+    bare_id: str,
+    md_index: dict[str, list[tuple[str, int]]],
+    or_index: dict[str, list[tuple[str, int]]],
+) -> tuple[int, str] | None:
+    """Return (epoch, source) for one bare id, or None when no source knows it."""
+    slug = _source_slug(bare_id)
+    if not slug:
+        return None
+    text = str(bare_id or "").strip().lower()
+    vendor = text.split("/", 1)[0] if "/" in text else ""
+    epoch = _pick_modelsdev_date(md_index.get(slug) or [], _MD_VENDOR_PROVIDERS.get(vendor))
+    if epoch is not None:
+        return epoch, "models.dev"
+    epoch = _pick_openrouter_date(bare_id, or_index.get(slug) or [], _OR_VENDOR_PREFIXES.get(vendor))
+    if epoch is not None:
+        return epoch, "openrouter"
+    return None
+
+
+def _meta_has_release_date(meta: dict, bare_id: str) -> bool:
+    """True when the row already resolves to a dated entry (exact or vendor alias)."""
+    candidates = [bare_id]
+    if "/" not in bare_id:
+        candidates.extend((f"openai/{bare_id}", f"anthropic/{bare_id}"))
+    for key in candidates:
+        entry = meta.get(key)
+        if isinstance(entry, dict) and _manager_release_value(entry.get("released")) is not None:
+            return True
+    return False
+
+
+def _enrich_meta_with_fallback_dates(
+    meta: dict[str, dict],
+    *,
+    timeout: float = _FALLBACK_SOURCE_TIMEOUT_S,
+) -> int:
+    """Fill missing release dates for manager inventory rows from fallback sources.
+
+    The gateway feed is primary; models.dev and OpenRouter are only fetched
+    when at least one inventory row still lacks a date, so a fully-dated
+    inventory costs no extra requests. Returns the number of rows dated.
+    """
+    try:
+        raw = get_available_models(include_hidden=True)
+    except Exception:
+        return 0
+    needed: list[str] = []
+    seen: set[str] = set()
+
+    def _note(candidate) -> None:
+        key = _manager_bare_id(str(candidate or ""))
+        if not key or key in seen:
+            return
+        seen.add(key)
+        if not _meta_has_release_date(meta, key):
+            needed.append(key)
+
+    for group in (raw.get("groups") or []) if isinstance(raw, dict) else []:
+        if not isinstance(group, dict):
+            continue
+        for bucket in ("models", "extra_models"):
+            for row in group.get(bucket) or []:
+                if isinstance(row, dict):
+                    _note(row.get("id"))
+    # The manager also renders placeholder rows from stored hidden lists for
+    # providers that are not currently discovered (e.g. openrouter); those
+    # rows need dates just the same, so consider their ids too.
+    try:
+        stored = _read_raw_settings_file()
+    except Exception:
+        stored = {}
+    for ids in ((stored.get("models_hidden") or {}) if isinstance(stored, dict) else {}).values():
+        if isinstance(ids, list):
+            for mid in ids:
+                _note(mid)
+    if not needed:
+        return 0
+    try:
+        md_index = _fetch_modelsdev_release_dates(timeout=timeout)
+    except Exception:
+        md_index = {}
+    resolved: dict[str, tuple[int, str]] = {}
+    unresolved: list[str] = []
+    for key in needed:
+        hit = _resolve_fallback_released(key, md_index, {})
+        if hit is not None:
+            resolved[key] = hit
+        else:
+            unresolved.append(key)
+    if unresolved:
+        try:
+            or_index = _fetch_openrouter_created_dates(timeout=timeout)
+        except Exception:
+            or_index = {}
+        for key in unresolved:
+            hit = _resolve_fallback_released(key, {}, or_index)
+            if hit is not None:
+                resolved[key] = hit
+    for key, (epoch, source) in resolved.items():
+        entry: dict | None = meta.get(key)
+        if not isinstance(entry, dict):
+            entry = {"type": None, "pricing": None, "tags": None, "name": None}
+            meta[key] = entry
+        entry["released"] = epoch
+        entry["released_source"] = source
+    return len(resolved)
+
+
+def refresh_models_meta(*, timeout: float = _GATEWAY_MODELS_TIMEOUT_S) -> dict:
+    """Fetch the gateway snapshot, enrich missing dates, persist snapshot + timestamps."""
+    try:
+        meta = _fetch_gateway_meta(timeout=timeout)
+        fallback_dates = _enrich_meta_with_fallback_dates(meta)
+    except Exception:
+        _record_meta_refresh_attempt()
+        raise
+    now = int(time.time())
+    saved = save_settings({
+        "models_meta": meta,
+        "models_meta_refreshed_at": now,
+        "models_meta_refresh_attempted_at": now,
+    })
     stored = saved.get("models_meta") if isinstance(saved, dict) else None
-    return {"ok": True, "models": len(stored) if isinstance(stored, dict) else len(meta)}
+    return {
+        "ok": True,
+        "models": len(stored) if isinstance(stored, dict) else len(meta),
+        "fallback_dates": fallback_dates,
+        "refreshed_at": now,
+    }
+
+
+def _record_meta_refresh_attempt() -> None:
+    """Timestamp a failed refresh so the next attempt backs off."""
+    try:
+        save_settings({"models_meta_refresh_attempted_at": int(time.time())})
+    except Exception:
+        pass
+
+
+def _meta_refresh_timestamps() -> tuple[int, int]:
+    """Return (last successful refresh, last attempt) epoch seconds, 0 when unset."""
+    try:
+        stored = _read_raw_settings_file()
+    except Exception:
+        stored = {}
+    values = []
+    for key in ("models_meta_refreshed_at", "models_meta_refresh_attempted_at"):
+        try:
+            values.append(int(stored.get(key) or 0))
+        except (TypeError, ValueError):
+            values.append(0)
+    return values[0], values[1]
+
+
+def models_meta_refresh_state(*, now: float | None = None) -> tuple[bool, bool]:
+    """Return (fresh, due): fresh = refreshed within TTL; due = stale and not backing off."""
+    refreshed, attempted = _meta_refresh_timestamps()
+    current = time.time() if now is None else now
+    fresh = bool(refreshed) and current - refreshed < _MANAGER_META_TTL_SECONDS
+    due = (not fresh) and not (attempted and current - attempted < _MANAGER_META_RETRY_SECONDS)
+    return fresh, due
 
 
 def _load_gateway_models_meta() -> dict:
@@ -12220,6 +12518,8 @@ _SETTINGS_DEFAULTS = {
     "models_global_hidden": [],
     "models_provider_overrides": {},
     "models_meta": {},  # gateway metadata cache: bare model id -> {type, released, created, ...} (patch 04)
+    "models_meta_refreshed_at": 0,  # patch 04: epoch of the last successful metadata refresh (TTL auto-refresh)
+    "models_meta_refresh_attempted_at": 0,  # patch 04: epoch of the last refresh attempt (failure backoff)
     "sidebar_density": "compact",  # compact | detailed
     "auto_title_refresh_every": "0",  # adaptive title refresh: 0=off, 5/10/20=every N exchanges
     "default_message_mode": "steer",  # behavior when sending while agent is running: queue | interrupt | steer
@@ -12493,6 +12793,8 @@ _SETTINGS_INT_RANGES = {
     "inflight_state_max_json_chars": (100000, 4000000),
     "structured_code_auto_tree_lines": (1, 1000),
     "voice_silence_ms": (200, 60000),
+    "models_meta_refreshed_at": (0, 4102444800),
+    "models_meta_refresh_attempted_at": (0, 4102444800),
 }
 _SETTINGS_FLOAT_RANGES = {
     "tts_rate": (0.5, 2.0),
