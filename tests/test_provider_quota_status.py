@@ -397,12 +397,14 @@ def test_codex_account_usage_subprocess_reports_read_only_credential_pool(monkey
     assert snapshot["windows"][0]["used_percent"] == 15
     assert snapshot["details"] == ["1/2 credentials available", "1 exhausted", "Plans: Pro"]
     assert snapshot["available"] is True
+    assert snapshot["pool"]["active_credential"] == "Team primary"
     assert snapshot["pool"] == {
         "total_credentials": 2,
         "queried_credentials": 2,
         "available_credentials": 1,
         "exhausted_credentials": 1,
         "failed_credentials": 0,
+        "active_credential": "Team primary",
         "plans": ["Pro"],
         "next_reset_at": "2030-03-17T17:46:40Z",
         "best_remaining_by_window": [
@@ -447,6 +449,7 @@ def test_codex_account_usage_subprocess_reports_read_only_credential_pool(monkey
                 "details": ["Credits balance: $12.50"],
                 "unavailable_reason": None,
                 "fetched_at": snapshot["pool"]["credentials"][0]["fetched_at"],
+                "is_active": True,
             },
             {
                 "label": "Plus backup",
@@ -457,6 +460,7 @@ def test_codex_account_usage_subprocess_reports_read_only_credential_pool(monkey
                 "unavailable_reason": "Credential pool marked this credential exhausted; retry after 2030-03-17T18:46:40Z.",
                 "retry_after": "2030-03-17T18:46:40Z",
                 "fetched_at": None,
+                "is_active": False,
             },
         ],
     }
@@ -1929,3 +1933,81 @@ def test_codex_pool_exhausted_credential_still_reports_banked_resets(monkeypatch
     assert "exhausted" in row["unavailable_reason"]
     assert seen == ["https://chatgpt.com/backend-api/wham/usage"]
     assert exhausted_token not in output
+
+
+def test_codex_pool_marks_the_available_row_serving_not_the_first_row(monkeypatch, capsys):
+    """The Active marker must follow selection, not row order.
+
+    ``fill_first`` serves the first AVAILABLE credential, so an exhausted row sitting
+    in front of the queue must not be marked active — otherwise the UI names an
+    account that cannot serve traffic.
+    """
+    import api.providers as providers
+
+    def b64url(payload: bytes) -> str:
+        return base64.urlsafe_b64encode(payload).rstrip(b"=").decode("ascii")
+
+    def token_for(account_id: str) -> str:
+        return ".".join([
+            b64url(b'{"alg":"none","typ":"JWT"}'),
+            b64url(json.dumps({
+                "https://api.openai.com/auth": {"chatgpt_account_id": account_id},
+            }).encode("utf-8")),
+            b64url(b"signature"),
+        ])
+
+    exhausted_token = token_for("acct-exhausted-first")
+
+    agent_mod = types.ModuleType("agent")
+    agent_mod.__path__ = []
+    account_usage_mod = types.ModuleType("agent.account_usage")
+    credential_pool_mod = types.ModuleType("agent.credential_pool")
+
+    class FakePool:
+        def entries(self):
+            return [
+                SimpleNamespace(  # exhausted, and FIRST in the queue
+                    label="Exhausted first",
+                    runtime_api_key=exhausted_token,
+                    runtime_base_url="https://chatgpt.com/backend-api/codex",
+                    last_status="exhausted",
+                    last_status_at=1_900_000_000,
+                ),
+                SimpleNamespace(  # healthy, but SECOND
+                    label="Healthy second",
+                    runtime_api_key=token_for("acct-healthy"),
+                    runtime_base_url="https://chatgpt.com/backend-api/codex",
+                    last_status=None,
+                ),
+            ]
+
+        def select(self):
+            raise AssertionError("quota display must not rotate credential_pool selection")
+
+    def fake_urlopen(req, timeout):
+        payload = {
+            "plan_type": "pro",
+            "rate_limit": {
+                "primary_window": {"used_percent": 20, "reset_at": "2030-03-17T22:00:00Z"},
+                "secondary_window": {"used_percent": 10, "reset_at": "2030-03-24T12:30:00Z"},
+            },
+        }
+        return _FakeResponse(json.dumps(payload).encode("utf-8"))
+
+    account_usage_mod.fetch_account_usage = lambda *a, **k: None
+    credential_pool_mod.load_pool = lambda provider: FakePool()
+    monkeypatch.setitem(sys.modules, "agent", agent_mod)
+    monkeypatch.setitem(sys.modules, "agent.account_usage", account_usage_mod)
+    monkeypatch.setitem(sys.modules, "agent.credential_pool", credential_pool_mod)
+    monkeypatch.setattr(providers.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(sys, "argv", ["quota-probe", "openai-codex", ""])
+
+    exec(providers._ACCOUNT_USAGE_SUBPROCESS_CODE, {"__name__": "__main__"})
+
+    snapshot = json.loads(capsys.readouterr().out.strip())
+    pool = snapshot["pool"]
+    by_label = {r["label"]: r for r in pool["credentials"]}
+
+    assert by_label["Exhausted first"]["is_active"] is False
+    assert by_label["Healthy second"]["is_active"] is True
+    assert pool["active_credential"] == "Healthy second"

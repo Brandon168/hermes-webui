@@ -11278,6 +11278,9 @@ function _buildProviderQuotaPoolBreakdown(accountLimits){
     const resetButton=bankedResets>0
       ? `<button class="provider-quota-reset" type="button" data-provider-quota-reset data-credential-index="${idx+1}" data-credential-label="${esc(label)}">Redeem 1 reset credit (${bankedResets} available)</button>`
       : '';
+    const activeBadge=credential&&credential.is_active
+      ? `<span class="provider-quota-pool-active" title="${esc(t('provider_quota_pool_active_title'))}">${esc(t('provider_quota_pool_active'))}</span>`
+      : '';
     const windowHtml=windows.length?windows.map(w=>{
       const remaining=_formatProviderQuotaPercent(w&&w.remaining_percent);
       const used=_formatProviderQuotaPercent(w&&w.used_percent);
@@ -11290,7 +11293,7 @@ function _buildProviderQuotaPoolBreakdown(accountLimits){
     return `
       <div class="provider-quota-pool-row provider-quota-pool-row-${status}">
         <div class="provider-quota-pool-row-head">
-          <span>${esc(label)}${esc(plan)}</span>
+          <span>${activeBadge}${esc(label)}${esc(plan)}</span>
           <span class="provider-quota-pool-row-head-actions"><strong>${esc(statusText)}</strong>${resetButton}</span>
         </div>
         <div class="provider-quota-pool-windows">${windowHtml}</div>

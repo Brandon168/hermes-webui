@@ -597,6 +597,18 @@ def _codex_pool_snapshot(entries, rows, queried):
         for row in rows
     )
     best_windows = _best_remaining_by_window(rows)
+    # The pool serves available[0] under the default fill_first strategy, so the
+    # first AVAILABLE row (not merely the first row) is the one serving traffic.
+    # _current_id is per-instance in-memory state and load_pool() returns a fresh
+    # pool per call, so it cannot be read here; priority order + status is the
+    # durable signal the quota worker can see.
+    active_label = None
+    for row in rows:
+        if row.get("status") == "available":
+            active_label = row.get("label")
+            break
+    for row in rows:
+        row["is_active"] = active_label is not None and row.get("label") == active_label
     pool = {
         "total_credentials": len(entries),
         "queried_credentials": queried,
@@ -608,6 +620,8 @@ def _codex_pool_snapshot(entries, rows, queried):
         "best_remaining_by_window": best_windows,
         "credentials": rows,
     }
+    if active_label is not None:
+        pool["active_credential"] = active_label
     if banked_resets > 0:
         pool["banked_resets"] = banked_resets
     details = [str(len(available_rows)) + "/" + str(len(entries)) + " credentials available"]
