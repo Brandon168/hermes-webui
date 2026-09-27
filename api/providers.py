@@ -644,10 +644,10 @@ def _codex_pool_snapshot(entries, rows, queried):
     )
 
 
-def _codex_pool_exhausted_row(entry, index):
+def _codex_pool_exhausted_row(entry, index, banked_resets=0):
     label = _safe_entry_label(entry, index)
     retry_after = _entry_pool_retry_after(entry)
-    return {
+    row = {
         "label": label,
         "status": "exhausted",
         "plan": None,
@@ -657,6 +657,24 @@ def _codex_pool_exhausted_row(entry, index):
         "retry_after": retry_after,
         "fetched_at": None,
     }
+    if banked_resets > 0:
+        row["banked_resets"] = banked_resets
+    return row
+
+
+def _probe_codex_exhausted_entry(item):
+    # Best-effort reset-credit probe for a credential the pool already marked exhausted.
+    # The local cooldown suppresses the usage query, which also hid any banked reset credits
+    # and so dropped the redeem control exactly when redeeming one restores the most. Status,
+    # windows and retry_after stay owned by the local pool state; only ``banked_resets`` is
+    # read here, and a failed probe leaves the row exactly as before.
+    index, entry = item
+    try:
+        snapshot = _fetch_codex_entry_snapshot(entry)[0]
+    except Exception:
+        snapshot = None
+    banked_resets = _snapshot_banked_resets(snapshot) if snapshot is not None else 0
+    return index, _codex_pool_exhausted_row(entry, index, banked_resets), 1
 
 
 def _probe_codex_pool_entry(item):
@@ -699,16 +717,23 @@ def _fetch_codex_account_usage_from_pool():
             return None
         rows_by_index = {}
         probe_items = []
+        exhausted_items = []
         queried = 0
         for index, entry in enumerate(entries, start=1):
             if _entry_is_pool_exhausted(entry):
+                exhausted_items.append((index, entry))
                 rows_by_index[index] = _codex_pool_exhausted_row(entry, index)
             else:
                 probe_items.append((index, entry))
-        if probe_items:
-            max_workers = min(_CODEX_POOL_MAX_WORKERS, len(probe_items))
+        if probe_items or exhausted_items:
+            # Exhausted credentials still need a query: it is the only source of their banked
+            # reset credits, and the redeem control is gated on that count.
+            max_workers = min(_CODEX_POOL_MAX_WORKERS, len(probe_items) + len(exhausted_items))
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                for index, row, did_query_count in executor.map(_probe_codex_pool_entry, probe_items):
+                futures = [executor.submit(_probe_codex_pool_entry, item) for item in probe_items]
+                futures += [executor.submit(_probe_codex_exhausted_entry, item) for item in exhausted_items]
+                for future in futures:
+                    index, row, did_query_count = future.result()
                     rows_by_index[index] = row
                     queried += did_query_count
         rows = [rows_by_index[index] for index in range(1, len(entries) + 1)]

@@ -380,12 +380,17 @@ def test_codex_account_usage_subprocess_reports_read_only_credential_pool(monkey
     assert fetch_calls == [("openai-codex", None, None)]
     assert load_pool_calls == ["openai-codex"]
     assert entries_called == [True]
+    # Every credential is queried: an exhausted one is still the only source of its banked
+    # reset credits, which gate the redeem control.
     assert [call["url"] for call in seen] == [
         "https://chatgpt.com/backend-api/wham/usage",
+        "https://chatgpt.com/backend-api/wham/usage",
     ]
-    assert [call["timeout"] for call in seen] == [4.0]
-    assert seen[0]["headers"]["authorization"] == f"Bearer {primary_token}"
-    assert seen[0]["headers"]["chatgpt-account-id"] == "acct-primary"
+    assert [call["timeout"] for call in seen] == [4.0, 4.0]
+    queried_ids = {call["headers"]["chatgpt-account-id"] for call in seen}
+    assert queried_ids == {"acct-primary", "acct-exhausted"}
+    assert primary_token in {call["headers"]["authorization"].removeprefix("Bearer ") for call in seen}
+    assert exhausted_token in {call["headers"]["authorization"].removeprefix("Bearer ") for call in seen}
     assert snapshot["provider"] == "openai-codex"
     assert snapshot["source"] == "usage_api_pool"
     assert snapshot["windows"][0]["label"] == "Session"
@@ -394,7 +399,7 @@ def test_codex_account_usage_subprocess_reports_read_only_credential_pool(monkey
     assert snapshot["available"] is True
     assert snapshot["pool"] == {
         "total_credentials": 2,
-        "queried_credentials": 1,
+        "queried_credentials": 2,
         "available_credentials": 1,
         "exhausted_credentials": 1,
         "failed_credentials": 0,
@@ -1835,3 +1840,92 @@ def test_provider_settings_patch_fetches_codex_pool_and_exposes_reset_control():
     assert "credential_index:index" in panels
     assert "'/api/provider/quota/reset'" in panels
     assert 'parsed.path == "/api/provider/quota/reset"' in routes
+
+
+def test_codex_pool_exhausted_credential_still_reports_banked_resets(monkeypatch, capsys):
+    """An exhausted credential must still surface its banked reset credits.
+
+    The redeem control is gated on ``banked_resets > 0``, so a pool cooldown that
+    suppressed the usage query also hid the button precisely when redeeming restores
+    the most. Local pool state stays authoritative for status and retry_after.
+    """
+    import api.providers as providers
+
+    def b64url(payload: bytes) -> str:
+        return base64.urlsafe_b64encode(payload).rstrip(b"=").decode("ascii")
+
+    def token_for(account_id: str) -> str:
+        return ".".join([
+            b64url(json.dumps({"alg": "RS256"}).encode("utf-8")),
+            b64url(json.dumps({
+                "https://api.openai.com/auth": {"chatgpt_account_id": account_id},
+            }).encode("utf-8")),
+            b64url(b"signature"),
+        ])
+
+    exhausted_token = token_for("acct-exhausted")
+    seen = []
+
+    agent_mod = types.ModuleType("agent")
+    agent_mod.__path__ = []
+    account_usage_mod = types.ModuleType("agent.account_usage")
+    credential_pool_mod = types.ModuleType("agent.credential_pool")
+
+    def fake_fetch_account_usage(provider, *, base_url=None, api_key=None):
+        return None
+
+    class FakePool:
+        def entries(self):
+            return [
+                SimpleNamespace(
+                    label="Plus exhausted",
+                    runtime_api_key=exhausted_token,
+                    runtime_base_url="https://chatgpt.com/backend-api/codex",
+                    last_status="exhausted",
+                    last_status_at=1_900_000_000,
+                ),
+            ]
+
+        def select(self):
+            raise AssertionError("quota display must not rotate credential_pool selection")
+
+    def fake_load_pool(provider):
+        return FakePool()
+
+    def fake_urlopen(req, timeout):
+        seen.append(req.full_url)
+        payload = {
+            "plan_type": "plus",
+            "rate_limit": {
+                "primary_window": {"used_percent": 100, "reset_at": "2030-03-17T22:00:00Z"},
+                "secondary_window": {"used_percent": 18, "reset_at": "2030-03-24T12:30:00Z"},
+            },
+            "rate_limit_reset_credits": {"available_count": 3, "applicable_available_count": 3},
+        }
+        return _FakeResponse(json.dumps(payload).encode("utf-8"))
+
+    account_usage_mod.fetch_account_usage = fake_fetch_account_usage
+    credential_pool_mod.load_pool = fake_load_pool
+    monkeypatch.setitem(sys.modules, "agent", agent_mod)
+    monkeypatch.setitem(sys.modules, "agent.account_usage", account_usage_mod)
+    monkeypatch.setitem(sys.modules, "agent.credential_pool", credential_pool_mod)
+    monkeypatch.setattr(providers.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(sys, "argv", ["quota-probe", "openai-codex", ""])
+
+    exec(providers._ACCOUNT_USAGE_SUBPROCESS_CODE, {"__name__": "__main__"})
+
+    output = capsys.readouterr().out.strip()
+    snapshot = json.loads(output)
+    row = snapshot["pool"]["credentials"][0]
+
+    # The redeem control renders only when the row reports banked credits.
+    assert row["status"] == "exhausted"
+    assert row["banked_resets"] == 3
+    assert snapshot["banked_resets"] == 3
+    assert snapshot["pool"]["banked_resets"] == 3
+    # Local cooldown state is untouched by the probe.
+    assert row["windows"] == []
+    assert row["retry_after"] is not None
+    assert "exhausted" in row["unavailable_reason"]
+    assert seen == ["https://chatgpt.com/backend-api/wham/usage"]
+    assert exhausted_token not in output
