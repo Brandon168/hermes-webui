@@ -7131,10 +7131,35 @@ def _main_model_request_overrides(
         service_tier = str(model_cfg.get("service_tier") or "").strip().lower()
         if service_tier == "priority":
             overrides["service_tier"] = "priority"
+    # Provider-level ``providers.<name>.extra_body`` (e.g. Vercel AI Gateway
+    # ``providerOptions.gateway.caching``) applies to every model on that
+    # provider; ``model.extra_body`` is merged on top and wins on conflict.
+    merged_extra_body: dict = {}
+    providers_cfg = config_data.get("providers")
+    provider_key = str(gate_provider or "").strip()
+    if isinstance(providers_cfg, dict) and provider_key:
+        entry = providers_cfg.get(provider_key)
+        if entry is None and provider_key.lower().startswith("custom:"):
+            entry = providers_cfg.get(provider_key.split(":", 1)[1])
+        provider_extra = entry.get("extra_body") if isinstance(entry, dict) else None
+        if isinstance(provider_extra, dict) and provider_extra:
+            merged_extra_body = copy.deepcopy(provider_extra)
     extra_body = model_cfg.get("extra_body")
     if isinstance(extra_body, dict) and extra_body:
-        overrides["extra_body"] = copy.deepcopy(extra_body)
+        merged_extra_body = _deep_merge_dicts(merged_extra_body, copy.deepcopy(extra_body))
+    if merged_extra_body:
+        overrides["extra_body"] = merged_extra_body
     return overrides
+
+
+def _deep_merge_dicts(base: dict, top: dict) -> dict:
+    """Return *base* with *top* merged in recursively; *top* wins on conflict."""
+    for key, value in top.items():
+        if isinstance(value, dict) and isinstance(base.get(key), dict):
+            base[key] = _deep_merge_dicts(base[key], value)
+        else:
+            base[key] = value
+    return base
 
 
 def _apply_advanced_model_options(model_cfg: dict, advanced: dict | None) -> None:
